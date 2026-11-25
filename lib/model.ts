@@ -1,6 +1,16 @@
-// Deterministic token-launch radar model: scores every pre-token protocol in a sealed snapshot
-// strictly from snapshot-native fields (TVL, category, 7-day momentum, listing age, chain breadth)
-// and generates a concrete 6-step farm plan for every ranked row.
+// Token Launch Radar - the implied-value model.
+//
+// The model reads only the sealed snapshot's own figures. For every protocol
+// that records no token yet it derives an implied launch value:
+//
+//   implied = tvl_usd x category_multiple x momentum x maturity x breadth
+//             x eligibility
+//
+// floored at $10,000, clamped at $100,000,000,000,000, in whole dollars.
+// The board then sorts by that value (ties by slug) and nudges values down
+// so the ranking is strictly decreasing. Nothing here reads a clock, a
+// random source, the network or the filesystem: the same snapshot always
+// produces the same board, byte for byte.
 
 export interface SnapshotProtocol {
   slug: string;
@@ -23,40 +33,12 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export interface ModelFactors {
+export interface RadarFactors {
   category_multiple: number;
   momentum: number;
   maturity: number;
   breadth: number;
   eligibility: number;
-}
-
-export interface BoardRow {
-  rank: number;
-  slug: string;
-  name: string;
-  category: string | null;
-  chains: string[];
-  tvl_usd: number;
-  change_7d: number | null;
-  mcap_usd: number | null;
-  listed_at: string | null;
-  gecko_id: string | null;
-  symbol: string | null;
-  age_days: number | null;
-  watchlist: boolean;
-  established: boolean;
-  implied_value_usd: number;
-  factors: ModelFactors;
-  farm_steps: string[];
-}
-
-export interface RadarMeta {
-  as_of: string;
-  floor_usd: number;
-  scanned: number;
-  pre_token: number;
-  watchlist_count: number;
 }
 
 export interface RadarRow {
@@ -71,1005 +53,746 @@ export interface RadarRow {
   watchlist: boolean;
   established: boolean;
   implied_value_usd: number;
-  factors: ModelFactors;
+  factors: RadarFactors;
   farm_steps: string[];
 }
 
-export interface RadarData {
+export interface RadarMeta {
+  as_of: string;
+  floor_usd: number;
+  scanned: number;
+  pre_token: number;
+  watchlist_count: number;
+}
+
+export interface Radar {
   meta: RadarMeta;
   rows: RadarRow[];
 }
 
-export class SnapshotError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'SnapshotError';
-  }
+export const IMPLIED_VALUE_FLOOR = 10000;
+export const MAX_IMPLIED_VALUE = 100000000000000;
+const ELIGIBILITY_CANDIDATE = 1;
+const ELIGIBILITY_ESTABLISHED = 0.04;
+const DAY_MS = 86400000;
+
+// ---------------------------------------------------------------------------
+// Category multiples: a prior over DefiLlama categories, in FDV/TVL terms -
+// what a launch in this sector has historically been worth against the TVL
+// already inside it. It is a table over categories only; no protocol name
+// or slug appears anywhere in this model.
+// ---------------------------------------------------------------------------
+const CATEGORY_MULTIPLES: Record<string, number> = {
+  Dexs: 2.2, // spot venues: proven swap fees support the richest launch multiples
+  Derivatives: 2.0, // perp venues monetise volume far beyond their margin TVL
+  "Prediction Market": 1.8, // consumer speculation launches hot relative to TVL
+  Chain: 1.6, // a network's token prices the whole blockspace, not just its TVL
+  "Interest Rate Derivatives": 1.6, // rate markets sit on top of lending volume
+  Lending: 1.5, // money markets launch against deep, sticky borrow demand
+  "Options Vault": 1.4, // structured yield vaults earn steady option premium
+  Payments: 1.4, // payment flow is worth more than the balances parked in it
+  "Risk Curators": 1.3, // curators take fees on other people's vault capital
+  "Onchain Capital Allocator": 1.3, // allocators skim yield across many venues
+  CDP: 1.3, // stablecoin issuers capture seigniorage on minted supply
+  Privacy: 1.3, // scarce category with loyal, compliance-tolerant demand
+  RWA: 1.2, // real-world yields are real but grow at an off-chain pace
+  "Leveraged Farming": 1.2, // leverage multiplies both fees and fragility
+  "CDP Manager": 1.2, // managed CDP books earn like their underlying issuers
+  "OTC Marketplace": 1.2, // block trading desks monetise flow, not balances
+  "Crypto Card Issuer": 1.2, // card spend generates interchange beyond TVL
+  "Collateral Markets": 1.2, // collateral routing earns on every loop it hosts
+  "Uncollateralized Lending": 1.2, // credit premiums are high, defaults too
+  "Yield Aggregator": 1.1, // aggregators keep a thin slice of routed yield
+  "Basis Trading": 1.1, // basis books earn funding, capped by hedge costs
+  "Liquidity Manager": 1.1, // managed liquidity earns fees on active ranges
+  Insurance: 1.1, // cover premiums accrue slowly against pooled capital
+  "Dual-Token Stablecoin": 1.1, // the volatile leg prices the system's growth
+  Yield: 1.0, // plain yield: the neutral prior, value tracks TVL one to one
+  Farm: 1.0, // incentive farms price close to the capital they attract
+  Restaking: 1.0, // restaking points convert at roughly par with TVL
+  Indexes: 1.0, // an index token is worth about the basket it tracks
+  Bridge: 0.9, // bridges earn thin tolls and carry outsized exploit risk
+  "Cross Chain Bridge": 0.9, // same toll economics as any bridge route
+  "Liquid Staking": 0.9, // staking tokens trade near the staked asset's value
+  "Liquid Restaking": 0.9, // receipt tokens price close to their backing
+  "Staking Pool": 0.9, // pooled staking keeps only a small commission
+  "Anchor BTC": 0.9, // BTC-anchored products price near their reserves
+  "Decentralized BTC": 0.9, // decentralised BTC wrappers track BTC closely
+  CeDeFi: 0.8, // centralised yield desks discount for counterparty risk
+  "Restaked BTC": 0.8, // restaked BTC receipts sit under several risk layers
+  "Governance Incentives": 0.8, // incentive tokens dilute as fast as they print
+  "Canonical Bridge": 0.7, // canonical bridges are infrastructure, priced thin
+  "Stablecoin Wrapper": 0.7, // wrappers add a layer, not new value
+  CEX: 0.6, // exchange products rarely launch a second, separate token fairly
+};
+const DEFAULT_CATEGORY_MULTIPLE = 1.0;
+
+export function categoryMultipleFor(category: string | null): number {
+  if (category === null) return DEFAULT_CATEGORY_MULTIPLE;
+  const multiple = CATEGORY_MULTIPLES[category];
+  return multiple === undefined ? DEFAULT_CATEGORY_MULTIPLE : multiple;
 }
 
-const DAY_MS = 86_400_000;
-export const IMPLIED_VALUE_FLOOR = 10_000;
-export const MAX_IMPLIED_VALUE = 1e14;
-
-/**
- * FDV/TVL category priors. Strictly category-level economics — never protocol names or slugs.
- */
-export const CATEGORY_MULTIPLES: Readonly<Record<string, number>> = {
-  Dexs: 2.2, // High fee turnover per dollar of liquidity and strong governance/fee-switch value.
-  Derivatives: 2.0, // High trading fee velocity relative to collateral margin locked.
-  'Interest Rate Derivatives': 1.9, // Leveraged rate trading captures outsized fees on modest TVL.
-  Chain: 1.6, // Base-layer L1/L2 tokens accrue gas, MEV, and ecosystem monetary premiums.
-  Options: 1.6, // Options venues earn spread and premium flow on relatively small collateral pools.
-  'Prediction Market': 1.6, // Event volume and mindshare typically outpace resting open interest.
-  Lending: 1.5, // Durable borrow demand and sticky institutional liquidity support mid-high multiples.
-  'Options Vault': 1.5, // Structured options vaults monetize recurring yield and volatility flow.
-  Payments: 1.4, // Payment rails monetize transaction throughput rather than idle locked capital.
-  Privacy: 1.4, // Specialized privacy networks command scarcity premiums over raw shielded TVL.
-  CDP: 1.4, // Stablecoin issuers monetize stability fees and seigniorage on collateral.
-  'Uncollateralized Lending': 1.4, // Credit origination earns higher spreads than overcollateralized pools.
-  'Collateral Markets': 1.4, // Modular collateral markets mirror core lending economics.
-  'Risk Curators': 1.3, // Performance-fee curation scales across underlying vaults with low capital overhead.
-  'Onchain Capital Allocator': 1.3, // Active multi-venue allocation earns management and performance fees.
-  'CDP Manager': 1.3, // Automation and liquidation protection layers extract recurring service fees.
-  'Governance Incentives': 1.3, // Bribe and vote-escrow marketplaces capture meta-governance cash flows.
-  RWA: 1.2, // Real-world asset wrappers carry regulated yield with tighter net fee margins.
-  'Leveraged Farming': 1.2, // Amplified strategy turnover boosts fee capture but remains cyclical.
-  'Liquidity Manager': 1.2, // Automated concentrated-LP management takes a steady slice of swap fees.
-  'Basis Trading': 1.2, // Funding-rate arbitrage earns carry but scales directly with hedge capacity.
-  'OTC Marketplace': 1.2, // Block-trade venues generate brokerage fees without holding deep idle TVL.
-  Insurance: 1.2, // Underwriting pools price risk premiums modestly above staked capacity.
-  Indexes: 1.2, // Onchain index baskets earn streaming management fees on AUM.
-  'Yield Aggregator': 1.1, // Auto-compounding aggregators retain thin performance fees on deposited TVL.
-  'Dual-Token Stablecoin': 1.1, // Algorithmic/dual-token designs trade near collateral backing with dilution risk.
-  Yield: 1.0, // General yield venues anchor the neutral baseline multiple.
-  Farm: 1.0, // Standard liquidity-mining farms sit at baseline valuation per TVL dollar.
-  'Stablecoin Wrapper': 1.0, // Wrapped yield-bearing stablecoins mirror underlying collateral value.
-  'Crypto Card Issuer': 1.0, // Card programs earn interchange on spend with modest onchain token capture.
-  Bridge: 0.45, // Cross-chain liquidity bridges earn thin basis-point spreads on large bridged custody.
-  'Cross Chain Bridge': 0.45, // Third-party cross-chain bridges face tight routing fee compression.
-  'Liquid Staking': 0.45, // Massive passive staking TVL with low commission take-rates compresses FDV/TVL.
-  'Liquid Restaking': 0.5, // Restaking wrappers stack modest fee margins on large base collateral.
-  Restaking: 0.5, // Shared-security collateral pools command sub-1x token-to-TVL ratios.
-  'Staking Pool': 0.4, // Commoditized validator pools operate on narrow commission margins.
-  'Restaked BTC': 0.45, // Wrapped BTC restaking vehicles mostly mirror passive underlying custody.
-  'Decentralized BTC': 0.45, // Bridged/tokenized BTC backing commands low standalone protocol take-rates.
-  'Anchor BTC': 0.4, // Custodial BTC anchor wrappers carry minimal standalone token capture.
-  'Canonical Bridge': 0.35, // Native rollup/chain bridges rarely capture independent fee tokens.
-  CeDeFi: 0.25, // Hybrid custodial products split economics offchain, sharply reducing token accrual.
-  CEX: 0.15, // Centralized exchange custody rarely converts user balances into a retroactive token launch.
-};
-
-export const DEFAULT_CATEGORY_MULTIPLE = 1.0;
-
-/**
- * Launch-eligibility screen mirroring the snapshot watchlist definition.
- * A launch radar ranks future token launches; established wrapped, staked, bridged, versioned,
- * and centralized-exchange products track tokens that already trade rather than waiting on a
- * launch of their own, so they receive a 0.04 eligibility factor instead of 1.0.
- */
-export const ELIGIBILITY_CANDIDATE = 1.0;
-export const ELIGIBILITY_ESTABLISHED = 0.04;
-
+// ---------------------------------------------------------------------------
+// Launch-eligibility screen. A protocol that is a wrapped, staked or bridged
+// product of a token that already trades is not waiting on a launch of its
+// own, and neither is a later version of a product line or an exchange's own
+// shelf product. The screen mirrors the watchlist's exclusion rules: six
+// categories, three whole words, eight exchange prefixes, one version
+// suffix pattern. Screened protocols stay on the board - they are large and
+// a reader should see them - but at a 0.04 eligibility factor, and their
+// farm plan says plainly that there is no launch to farm.
+// ---------------------------------------------------------------------------
 const ESTABLISHED_CATEGORIES = new Set([
-  'Bridge',
-  'Canonical Bridge',
-  'Liquid Staking',
-  'Liquid Restaking',
-  'Restaked BTC',
-  'CEX',
+  "Bridge",
+  "Canonical Bridge",
+  "Liquid Staking",
+  "Liquid Restaking",
+  "Restaked BTC",
+  "CEX",
 ]);
 
 const ESTABLISHED_WORD_PATTERN = /\b(?:wrapped|staked|staking)\b/i;
-const EXCHANGE_PREFIX_PATTERN = /^(?:Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/i;
+const EXCHANGE_PREFIX_PATTERN =
+  /^(?:Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/i;
 const VERSION_SUFFIX_PATTERN = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
-/** Returns true when a protocol is an established product rather than a genuine token launch candidate. */
-export function isEstablishedProduct(protocol: SnapshotProtocol): boolean {
-  if (protocol.category !== null && ESTABLISHED_CATEGORIES.has(protocol.category)) return true;
-  if (ESTABLISHED_WORD_PATTERN.test(protocol.name)) return true;
-  if (EXCHANGE_PREFIX_PATTERN.test(protocol.name)) return true;
-  if (VERSION_SUFFIX_PATTERN.test(protocol.name)) return true;
-  return false;
+export function establishedReason(protocol: SnapshotProtocol): string | null {
+  if (protocol.category !== null && ESTABLISHED_CATEGORIES.has(protocol.category)) {
+    if (protocol.category === "CEX") {
+      return "an exchange product tied to a platform whose token already trades";
+    }
+    if (protocol.category === "Bridge" || protocol.category === "Canonical Bridge") {
+      return "a bridged-asset product tracking a token that already trades";
+    }
+    return "a staking product tracking a token that already trades";
+  }
+  if (ESTABLISHED_WORD_PATTERN.test(protocol.name)) {
+    return "a wrapped or staked product tracking a token that already trades";
+  }
+  if (EXCHANGE_PREFIX_PATTERN.test(protocol.name)) {
+    return "an exchange-branded product tracking a token that already trades";
+  }
+  if (VERSION_SUFFIX_PATTERN.test(protocol.name)) {
+    return "a later version of a product line whose token already trades";
+  }
+  return null;
 }
 
-const EVM_L2_CHAINS = new Set([
-  'Arbitrum',
-  'Base',
-  'Optimism',
-  'Polygon',
-  'Linea',
-  'Scroll',
-  'Blast',
-  'zkSync Era',
-  'Unichain',
-  'Mode',
-  'Mantle',
-  'Avalanche',
-  'Binance',
-  'Sonic',
-  'Berachain',
-  'Monad',
-  'Plasma',
-  'Hyperliquid L1',
-  'Gnosis',
-  'Celo',
-  'Fantom',
-  'Metis',
-  'Manta',
-  'Taiko',
-  'Katana',
-  'Ink',
-  'Soneium',
-  'Abstract',
-  'World Chain',
-  'Robinhood Chain',
+export function isEstablishedProduct(protocol: SnapshotProtocol): boolean {
+  return establishedReason(protocol) !== null;
+}
+
+export function isPreToken(protocol: SnapshotProtocol): boolean {
+  return protocol.gecko_id === null && protocol.symbol === null;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot parsing. Deliberately light: the snapshot is a sealed house file
+// with a fixed shape; we check the load-bearing arrays exist and hand the
+// rest to the model untouched.
+// ---------------------------------------------------------------------------
+export function parseSnapshot(text: string): Snapshot {
+  const raw = JSON.parse(text) as Partial<Snapshot>;
+  if (typeof raw.as_of !== "string" || raw.as_of.length === 0) {
+    throw new Error("snapshot is missing its as_of date");
+  }
+  if (!Array.isArray(raw.protocols) || raw.protocols.length === 0) {
+    throw new Error("snapshot carries no protocols array");
+  }
+  if (!Array.isArray(raw.watchlist)) {
+    throw new Error("snapshot carries no watchlist array");
+  }
+  return {
+    as_of: raw.as_of,
+    source: typeof raw.source === "string" ? raw.source : "",
+    floor_usd: typeof raw.floor_usd === "number" ? raw.floor_usd : 0,
+    protocols: raw.protocols as SnapshotProtocol[],
+    watchlist: raw.watchlist as string[],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Factors. Each is a pure function of snapshot fields.
+// ---------------------------------------------------------------------------
+function clamp(value: number, low: number, high: number): number {
+  return Math.min(high, Math.max(low, value));
+}
+
+export function computeAgeDays(asOf: string, listedAt: string | null): number | null {
+  if (listedAt === null) return null;
+  const asOfMs = Date.parse(asOf + "T00:00:00Z");
+  const listedMs = Date.parse(listedAt + "T00:00:00Z");
+  if (!Number.isFinite(asOfMs) || !Number.isFinite(listedMs)) return null;
+  return Math.max(0, Math.floor((asOfMs - listedMs) / DAY_MS));
+}
+
+export function momentumFactor(change7d: number | null): number {
+  if (change7d === null) return 1;
+  return 1 + (clamp(change7d, -40, 120) / 100) * 0.6;
+}
+
+export function maturityFactor(ageDays: number | null): number {
+  if (ageDays === null) return 1;
+  return 0.8 + (0.45 * Math.min(ageDays, 1460)) / 1460;
+}
+
+export function breadthFactor(chainCount: number): number {
+  return 1 + 0.04 * Math.min(Math.max(chainCount, 1) - 1, 5);
+}
+
+// ---------------------------------------------------------------------------
+// Chain profile: where a farm plan should run, and what gas there costs.
+// The protocol's own chain list is scanned in its listed order and the first
+// cheap home wins - Solana whenever it is listed ahead of every low-fee EVM
+// chain, otherwise the first low-fee EVM chain listed. Ethereum mainnet is
+// only chosen when no cheap alternative is listed at all, and a Bitcoin-only
+// product keeps a Bitcoin budget.
+// ---------------------------------------------------------------------------
+type ChainClass = "sol" | "eth" | "btc" | "lowfee";
+
+interface ChainProfile {
+  chain: string;
+  gas: string;
+  klass: ChainClass;
+}
+
+const LOW_FEE_EVM_CHAINS = new Set([
+  "Arbitrum",
+  "Arbitrum Nova",
+  "Avalanche",
+  "Base",
+  "Berachain",
+  "Binance",
+  "Bitlayer",
+  "Bittensor EVM",
+  "Blast",
+  "BOB",
+  "Celo",
+  "Citrea",
+  "CORE",
+  "Corn",
+  "Cronos",
+  "Etherlink",
+  "Fantom",
+  "Flare",
+  "Fraxtal",
+  "HashKey Chain",
+  "Hemi",
+  "Hyperliquid L1",
+  "Ink",
+  "Katana",
+  "Kava",
+  "Linea",
+  "Lisk",
+  "Manta",
+  "Mantle",
+  "MegaETH",
+  "Metis",
+  "Mode",
+  "Monad",
+  "Moonbeam",
+  "Moonriver",
+  "Morph",
+  "Op_Bnb",
+  "Optimism",
+  "Plasma",
+  "Polygon",
+  "Polygon zkEVM",
+  "RISE",
+  "Scroll",
+  "Sei",
+  "Soneium",
+  "Sonic",
+  "Sophon",
+  "Stable",
+  "Swellchain",
+  "TAC",
+  "Taiko",
+  "Unichain",
+  "World Chain",
+  "X Layer",
+  "XRPL EVM",
+  "zkSync Era",
+  "Zircuit",
 ]);
 
-const URL_PATTERN = /\b(?:https?:\/\/|www\.)/i;
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
+export function chainProfileFor(chains: string[]): ChainProfile {
+  for (const chain of chains) {
+    if (chain === "Solana") {
+      return { chain, gas: "about $1/month", klass: "sol" };
+    }
+    if (LOW_FEE_EVM_CHAINS.has(chain)) {
+      return { chain, gas: "$1-$5/month", klass: "lowfee" };
+    }
+  }
+  if (chains.includes("Ethereum")) {
+    return { chain: "Ethereum", gas: "$15-$40/month", klass: "eth" };
+  }
+  if (chains.includes("Bitcoin")) {
+    return { chain: "Bitcoin", gas: "$5-$15/month", klass: "btc" };
+  }
+  const first = chains.length > 0 ? chains[0] : "Ethereum";
+  return { chain: first, gas: "$1-$5/month", klass: "lowfee" };
 }
 
-function round4(value: number): number {
-  return Math.round(value * 10_000) / 10_000;
+// ---------------------------------------------------------------------------
+// TVL tiers: position sizes a small farmer can actually run.
+// ---------------------------------------------------------------------------
+interface TvlTier {
+  size: string;
+  label: string;
+  note: string;
+}
+
+function tvlTierFor(tvlUsd: number): TvlTier {
+  if (tvlUsd >= 500000000) {
+    return {
+      size: "$250-$1,000",
+      label: "large-TVL $500M+ tier",
+      note: "sized to clear typical minimum-balance filters on deep pools",
+    };
+  }
+  if (tvlUsd >= 50000000) {
+    return {
+      size: "$100-$500",
+      label: "mid-TVL $50M-$500M tier",
+      note: "balanced for a meaningful share without over-concentrating capital",
+    };
+  }
+  return {
+    size: "$25-$150",
+    label: "early sub-$50M tier",
+    note: "kept small while the protocol is still proving itself",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Small deterministic helpers. Variety in the farm plans comes from a hash
+// of the protocol's own slug - stable across runs, different per protocol,
+// so two protocols in the same bucket no longer read word for word alike.
+// ---------------------------------------------------------------------------
+function slugSeed(slug: string): number {
+  let hash = 7;
+  for (let i = 0; i < slug.length; i++) {
+    hash = (hash * 31 + slug.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function pickVariant(variants: string[], seed: number, salt: number): string {
+  return variants[(seed + salt) % variants.length];
+}
+
+function formatPct(change7d: number): string {
+  const rounded = Math.round(change7d * 10) / 10;
+  const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  return (rounded >= 0 ? "+" : "") + text + "%";
+}
+
+function formatAge(ageDays: number): string {
+  if (ageDays < 60) return ageDays + " days";
+  if (ageDays < 730) return Math.round(ageDays / 30.44) + " months";
+  const years = Math.round((ageDays / 365.25) * 10) / 10;
+  return (Number.isInteger(years) ? String(years) : years.toFixed(1)) + " years";
+}
+
+type AgeBucket = "fresh" | "mid" | "seasoned" | "unknown";
+type MomentumBucket = "rising" | "steady" | "cooling" | "unknown";
+
+function ageBucketFor(ageDays: number | null): AgeBucket {
+  if (ageDays === null) return "unknown";
+  if (ageDays < 180) return "fresh";
+  if (ageDays < 730) return "mid";
+  return "seasoned";
+}
+
+function momentumBucketFor(change7d: number | null): MomentumBucket {
+  if (change7d === null) return "unknown";
+  if (change7d >= 5) return "rising";
+  if (change7d <= -5) return "cooling";
+  return "steady";
+}
+
+// ---------------------------------------------------------------------------
+// Farm plans: exactly six steps per protocol, generated from its own
+// category, chains, TVL tier, age and momentum. Every step states an action,
+// a cost or a time. Established products get a different plan whose first
+// step says there is no launch to farm.
+// ---------------------------------------------------------------------------
+interface FarmContext {
+  tier: TvlTier;
+  profile: ChainProfile;
+  ageDays: number | null;
+  ageBucket: AgeBucket;
+  momentumBucket: MomentumBucket;
+  seed: number;
+}
+
+function setupStep(protocol: SnapshotProtocol, ctx: FarmContext): string {
+  const { tier, profile } = ctx;
+  let preferNote = "";
+  if (profile.chain !== protocol.chains[0]) {
+    if (protocol.chains.includes("Ethereum") && profile.chain !== "Ethereum") {
+      preferNote =
+        " (preferring " + profile.chain + " over Ethereum mainnet cuts gas from $15-$40/month to " + profile.gas + ")";
+    } else if (protocol.chains.length > 1) {
+      preferNote = " (the cheapest of its " + protocol.chains.length + " networks to operate on)";
+    }
+  }
+  return (
+    "Set up a dedicated wallet on " + profile.chain + " with " + tier.size +
+    " (" + tier.label + "; " + tier.note + ") and allocate " + profile.gas +
+    " for gas" + preferNote + "; takes about 10 minutes."
+  );
+}
+
+function coreStep(protocol: SnapshotProtocol, ctx: FarmContext): string {
+  const name = protocol.name;
+  const size = ctx.tier.size;
+  const chain = ctx.profile.chain;
+  switch (protocol.category) {
+    case "Dexs":
+      return "Route two or three swaps a week through " + name + "'s deepest markets on " + chain + " and park the working balance in its most liquid pool pair, so both trade count and LP share register (15-20 minutes/week).";
+    case "Lending":
+      return "Supply " + size + " of collateral on " + name + " through " + chain + ", borrow no more than a third of its value against it, and run a careful repay-and-resupply cycle each week so the position never nears liquidation (15 minutes/week).";
+    case "Derivatives":
+    case "Interest Rate Derivatives":
+      return "Open small, hedged positions on " + name + " - a long and an offsetting short across two markets - and roll them weekly, keeping total notional inside " + size + " so funding costs stay trivial (20 minutes/week).";
+    case "Yield":
+    case "Yield Aggregator":
+      return "Deposit " + size + " into " + name + "'s main vault on " + chain + " and leave the shares compounding; add a small top-up each week rather than hopping between vaults (10 minutes/week).";
+    case "Bridge":
+    case "Cross Chain Bridge":
+      return "Bridge a " + size + " position across two of " + name + "'s busiest routes each week, alternating direction, and let the landed funds work on the destination chain for a few days before bridging again (15 minutes/week).";
+    case "RWA":
+      return "Open an account with " + name + " and complete its KYC and eligibility checks up front (they can take days), then deposit " + size + " into its flagship real-world-asset vault on " + chain + " (30 minutes once, then 5 minutes/week).";
+    case "CDP":
+    case "CDP Manager":
+      return "Mint a small stablecoin position on " + name + " by locking collateral worth roughly twice the " + size + " you draw, and keep the liquidation buffer untouched (15 minutes to open, 5 minutes/week to check).";
+    case "Risk Curators":
+    case "Onchain Capital Allocator":
+    case "Liquidity Manager":
+      return "Deposit " + size + " into one of " + name + "'s flagship curated vaults on " + chain + " after checking the underlying markets, collateral caps and curator performance fees (10-15 minutes).";
+    case "Staking Pool":
+    case "Restaking":
+      return "Stake " + size + " through " + name + " on " + chain + " and hold the receipt token in a wallet you control; if a low-risk pool accepts the receipt, put a slice of it to work there (10 minutes).";
+    case "Leveraged Farming":
+    case "Farm":
+      return "Open a conservative leveraged loop on " + name + " - supply, borrow the same asset, resupply once - sized inside " + size + " with leverage low enough that one bad week cannot liquidate it (20 minutes to set up).";
+    case "Basis Trading":
+      return "Fund a delta-neutral basis position through " + name + " with " + size + ": hold the spot leg and the offsetting hedge it specifies, and check the funding spread weekly (15 minutes/week).";
+    case "Prediction Market":
+      return "Take two or three small positions a week in " + name + "'s most liquid markets, sized from the " + size + " budget, and let each one resolve rather than trading in and out (15 minutes/week).";
+    case "Payments":
+      return "Route a real recurring payment through " + name + " each week - an invoice, a subscription or a transfer you would make anyway - building genuine volume history inside the " + size + " working balance (5 minutes/week).";
+    case "Crypto Card Issuer":
+      return "Fund " + name + "'s card with " + size + " and route everyday spending you already make through it, keeping the balance topped up weekly (5 minutes/week).";
+    case "Insurance":
+      return "Buy a small cover on " + name + " for a position you actually hold, or underwrite " + size + " into its lowest-risk cover pool, and renew on schedule (10 minutes).";
+    case "Indexes":
+      return "Buy " + size + " of " + name + "'s flagship index basket on " + chain + " and hold it; rebalance only when the index itself does (10 minutes).";
+    case "Privacy":
+      return "Make one small, ordinary transaction through " + name + " each week from your dedicated wallet, sized inside " + size + ", and keep clean records of every deposit and withdrawal (10 minutes/week).";
+    case "Chain":
+      return "Bridge " + size + " onto the " + name + " network itself, then transact there weekly - a swap, a transfer and one app interaction - so the wallet builds a real history on the chain (15 minutes/week).";
+    case "CEX":
+      return "Skip the heavy farming here: an exchange product rarely shares a fair launch with outside farmers, so limit activity to a small " + size + " trading balance used for ordinary spot trades (10 minutes/week).";
+    default:
+      return "Use " + name + "'s core product on " + chain + " every week with the " + size + " working balance - one genuine transaction a week beats ten empty ones (10-15 minutes/week).";
+  }
+}
+
+function rhythmStep(protocol: SnapshotProtocol, ctx: FarmContext): string {
+  const options: string[] = [
+    "Keep the same wallet and position all season: one maintenance action a week - a top-up, a harvest or a rebalance - inside your " + ctx.profile.gas + " gas budget registers steadier activity than sporadic large moves (10 minutes/week).",
+    "Work the position on a weekly rhythm: check its health, claim anything accrued, and add a small top-up from the " + ctx.tier.size + " budget rather than resizing the whole position (10 minutes/week).",
+    "Avoid hopping between protocols mid-season; deepen this one position with a small weekly action so your balance history compounds in a single place (10 minutes/week).",
+  ];
+  if (ctx.momentumBucket === "rising" && protocol.change_7d !== null) {
+    options.push(
+      "Seven-day TVL is up strongly (" + formatPct(protocol.change_7d) + "): keep the weekly action on schedule and resist doubling size just because momentum is hot (10 minutes/week).",
+    );
+  }
+  if (ctx.momentumBucket === "cooling" && protocol.change_7d !== null) {
+    options.push(
+      "Seven-day TVL has slipped (" + formatPct(protocol.change_7d) + "): hold size steady, skip fresh deposits, and let the scheduled weekly action carry your activity until momentum turns (10 minutes/week).",
+    );
+  }
+  if (ctx.momentumBucket === "steady" && protocol.change_7d !== null) {
+    options.push(
+      "Seven-day TVL is nearly flat (" + formatPct(protocol.change_7d) + "), so consistency is the edge: the same small action, same wallet, every week of the season (10 minutes/week).",
+    );
+  }
+  if (ctx.ageBucket === "fresh" && ctx.ageDays !== null) {
+    options.push(
+      "Listed only " + ctx.ageDays + " days ago, this one rewards frequency over size: several small interactions a week read better than one large deposit (10 minutes/week).",
+    );
+  }
+  if (ctx.ageBucket === "seasoned" && ctx.ageDays !== null) {
+    options.push(
+      "Running " + formatAge(ctx.ageDays) + " with no token yet, it rewards patience: an old wallet with an unbroken weekly history is exactly what a late launch snapshot tends to favour (10 minutes/week).",
+    );
+  }
+  return pickVariant(options, ctx.seed, 3);
+}
+
+function reviewStep(protocol: SnapshotProtocol, ctx: FarmContext): string {
+  const options: string[] = [
+    "Review the position once a week (10 minutes/week): rate or APY earned, withdrawal terms and any change to fees or collateral, while keeping maintenance transactions inside your " + ctx.profile.gas + " gas budget.",
+    "Once a week, sanity-check the numbers that matter - share price, pending rewards, queue times - and log them next to your gas spend (10 minutes/week).",
+  ];
+  if (protocol.chains.length >= 4) {
+    options.push(
+      "It runs on " + protocol.chains.length + " chains; once a week confirm your " + ctx.profile.chain + " deployment is still the cheapest home for the position and that no chain-specific incentive has opened elsewhere (10 minutes/week).",
+    );
+  }
+  if (protocol.chains.length === 1) {
+    options.push(
+      "Everything sits on " + ctx.profile.chain + ", so the weekly review is short: position size, earned yield, and any governance or parameter change (5-10 minutes/week).",
+    );
+  }
+  if (ctx.ageBucket === "mid" && ctx.ageDays !== null) {
+    options.push(
+      "At " + formatAge(ctx.ageDays) + " old it is past the fragile stage; the weekly review can stay light - position, yield, and one look at its announcements (5-10 minutes/week).",
+    );
+  }
+  return pickVariant(options, ctx.seed, 5);
+}
+
+function holdStep(protocol: SnapshotProtocol, ctx: FarmContext): string {
+  const options: string[] = [
+    "Hold across 8-12 weeks so time-weighted balance snapshots accumulate under any points or season programme it runs; unwinding early forfeits the history you have been building.",
+    "Stay the full 8-12 week season unless the risk picture changes: most launch programmes weight duration and consistency, not a single week's size.",
+  ];
+  options.push(
+    "Commit to the 8-12 week horizon before you start: a position opened and abandoned in week two earns nothing but gas receipts.",
+  );
+  return pickVariant(options, ctx.seed, 7);
+}
+
+function recordStep(ctx: FarmContext): string {
+  const options: string[] = [
+    "Keep a weekly log of share price, net yield and gas costs (5 minutes/week) so you can measure the true net return before deciding whether to unwind after 8-12 weeks.",
+    "At week 8, review the log: if net yield after gas beats your next candidate, extend to 12 weeks; if not, unwind cleanly and rotate the capital (15 minutes).",
+    "Record every fee and reward as you go (5 minutes/week); a farmer who cannot show net numbers after gas is guessing, not farming.",
+  ];
+  return pickVariant(options, ctx.seed, 11);
+}
+
+function establishedSteps(
+  protocol: SnapshotProtocol,
+  reason: string,
+  ctx: FarmContext,
+): string[] {
+  const name = protocol.name;
+  const tier = ctx.tier;
+  const profile = ctx.profile;
+  const batchNote =
+    profile.klass === "btc"
+      ? " (batch Bitcoin transactions during lower mempool fee windows)"
+      : "";
+  const moveStep = pickVariant(
+    [
+      "If you hold or move exposure on " + profile.chain + ", keep transaction overhead inside a " + profile.gas + " gas budget" + batchNote + " and avoid unnecessary deposits, withdrawals or bridge round-trips.",
+      "Keep any movement of the position on " + profile.chain + " rare and deliberate: batch transfers together" + batchNote + " so total overhead stays inside a " + profile.gas + " gas budget.",
+    ],
+    ctx.seed,
+    3,
+  );
+  const riskReview = pickVariant(
+    [
+      "Review peg stability, custody or validator risk and withdrawal queues once a week (5 minutes/week over the 8-12 week holding period) rather than assuming passive holding earns an unannounced token.",
+      "Once a week, spend 5 minutes on the risks that actually apply here - peg, custodian, validator set and exit queues - instead of farming activity that earns nothing.",
+    ],
+    ctx.seed,
+    5,
+  );
+  return [
+    "No launch to farm: " + name + " is " + reason + ", so do not commit airdrop-hunting capital here; treat it purely as an exposure tool and keep monitoring to 5 minutes/week.",
+    "Only use " + name + " if you already want the underlying exposure; size any voluntary allocation conservatively at " + tier.size + " (" + tier.label + ") rather than chasing speculative points.",
+    moveStep,
+    "Before minting, staking or bridging through " + name + ", compare the secondary-market spread against native mint or redemption fees (10 minutes) so slippage does not outweigh the underlying yield.",
+    riskReview,
+    "Keep a lean log of entry cost, fees and yield (5 minutes/month), and direct active farming hours toward unlaunched candidates carrying the full 1.00x launch-eligibility factor.",
+  ];
+}
+
+export function buildFarmSteps(
+  protocol: SnapshotProtocol,
+  established: boolean,
+  reason: string | null,
+  ageDays: number | null,
+): string[] {
+  const ctx: FarmContext = {
+    tier: tvlTierFor(protocol.tvl_usd),
+    profile: chainProfileFor(protocol.chains),
+    ageDays,
+    ageBucket: ageBucketFor(ageDays),
+    momentumBucket: momentumBucketFor(protocol.change_7d),
+    seed: slugSeed(protocol.slug),
+  };
+  if (established && reason !== null) {
+    return establishedSteps(protocol, reason, ctx);
+  }
+  return [
+    setupStep(protocol, ctx),
+    coreStep(protocol, ctx),
+    rhythmStep(protocol, ctx),
+    reviewStep(protocol, ctx),
+    holdStep(protocol, ctx),
+    recordStep(ctx),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// Scoring and board construction.
+// ---------------------------------------------------------------------------
+interface Scored {
+  protocol: SnapshotProtocol;
+  ageDays: number | null;
+  established: boolean;
+  reason: string | null;
+  factors: RadarFactors;
+  impliedValue: number;
+}
+
+function scoreProtocol(protocol: SnapshotProtocol, asOf: string): Scored {
+  const categoryMultiple = categoryMultipleFor(protocol.category);
+  const momentum = momentumFactor(protocol.change_7d);
+  const ageDays = computeAgeDays(asOf, protocol.listed_at);
+  const maturity = maturityFactor(ageDays);
+  const breadth = breadthFactor(protocol.chains.length);
+  const reason = establishedReason(protocol);
+  const established = reason !== null;
+  const eligibility = established ? ELIGIBILITY_ESTABLISHED : ELIGIBILITY_CANDIDATE;
+  const raw = Math.round(
+    protocol.tvl_usd * categoryMultiple * momentum * maturity * breadth * eligibility,
+  );
+  const impliedValue = Math.min(MAX_IMPLIED_VALUE, Math.max(IMPLIED_VALUE_FLOOR, raw));
+  return {
+    protocol,
+    ageDays,
+    established,
+    reason,
+    factors: {
+      category_multiple: categoryMultiple,
+      momentum,
+      maturity,
+      breadth,
+      eligibility,
+    },
+    impliedValue,
+  };
 }
 
 function compareSlug(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** Whole UTC days between listed_at and the snapshot's as_of; null if listed_at is absent or invalid. */
-export function computeAgeDays(asOf: string, listedAt: string | null): number | null {
-  if (listedAt === null) return null;
-  const asOfMs = Date.parse(`${asOf}T00:00:00Z`);
-  const listedMs = Date.parse(`${listedAt}T00:00:00Z`);
-  if (!Number.isFinite(asOfMs) || !Number.isFinite(listedMs)) return null;
-  return Math.max(0, Math.floor((asOfMs - listedMs) / DAY_MS));
-}
+export function buildRadar(snapshot: Snapshot): Radar {
+  const watchlist = new Set(snapshot.watchlist);
+  const scored = snapshot.protocols
+    .filter(isPreToken)
+    .map((protocol) => scoreProtocol(protocol, snapshot.as_of));
 
-/** Category FDV/TVL prior lookup with neutral 1.0 fallback. */
-export function categoryMultipleFor(category: string | null): number {
-  if (category === null) return DEFAULT_CATEGORY_MULTIPLE;
-  return CATEGORY_MULTIPLES[category] ?? DEFAULT_CATEGORY_MULTIPLE;
-}
-
-/** Compute the five model factors and raw floored implied value for one protocol. */
-export function scoreProtocol(
-  protocol: SnapshotProtocol,
-  asOf: string,
-): { age_days: number | null; established: boolean; factors: ModelFactors; implied_value_usd: number } {
-  const category_multiple = categoryMultipleFor(protocol.category);
-
-  const momentum =
-    protocol.change_7d === null
-      ? 1.0
-      : 1 + (clamp(protocol.change_7d, -40, 120) / 100) * 0.6;
-
-  const age_days = computeAgeDays(asOf, protocol.listed_at);
-  const maturity =
-    age_days === null ? 1.0 : 0.8 + (0.45 * Math.min(age_days, 1460)) / 1460;
-
-  const chainCount = Math.max(1, protocol.chains.length);
-  const breadth = 1 + 0.04 * Math.min(chainCount - 1, 5);
-
-  // A launch radar ranks future launches; established products track existing tokens.
-  const established = isEstablishedProduct(protocol);
-  const eligibility = established ? ELIGIBILITY_ESTABLISHED : ELIGIBILITY_CANDIDATE;
-
-  const rawImplied = Math.round(
-    protocol.tvl_usd * category_multiple * momentum * maturity * breadth * eligibility,
-  );
-  // Floor for ranking stability; also clamp at MAX_IMPLIED_VALUE so no row can ever
-  // exceed the board invariant that boardIssue enforces, however large a TVL gets.
-  const implied_value_usd = Math.min(
-    MAX_IMPLIED_VALUE,
-    Math.max(IMPLIED_VALUE_FLOOR, rawImplied),
-  );
-
-  return {
-    age_days,
-    established,
-    factors: {
-      category_multiple: round4(category_multiple),
-      momentum: round4(momentum),
-      maturity: round4(maturity),
-      breadth: round4(breadth),
-      eligibility: round4(eligibility),
-    },
-    implied_value_usd,
-  };
-}
-
-/** Pre-token universe: protocols with neither CoinGecko id nor token ticker symbol. */
-export function isPreToken(protocol: SnapshotProtocol): boolean {
-  return protocol.gecko_id === null && protocol.symbol === null;
-}
-
-interface CapitalTier {
-  sizeRange: string;
-  tierLabel: string;
-  splitNote: string;
-}
-
-function capitalTierFor(tvlUsd: number): CapitalTier {
-  if (tvlUsd >= 500_000_000) {
-    return {
-      sizeRange: '$250-$1,000',
-      tierLabel: 'large-TVL $500M+',
-      splitNote: 'sized to clear typical minimum-balance filters on deep pools',
-    };
-  }
-  if (tvlUsd >= 50_000_000) {
-    return {
-      sizeRange: '$100-$500',
-      tierLabel: 'mid-TVL $50M-$500M',
-      splitNote: 'balanced for meaningful share without over-concentrating capital',
-    };
-  }
-  return {
-    sizeRange: '$25-$150',
-    tierLabel: 'early-TVL under $50M',
-    splitNote: 'capped conservatively to manage smart-contract and liquidity risk',
-  };
-}
-
-function displayChain(chain: string): string {
-  return chain === 'Binance' ? 'BNB Chain' : chain;
-}
-
-interface ChainProfile {
-  primaryChain: string;
-  secondaryChain: string | null;
-  gasBudget: string;
-  chainNote: string;
-}
-
-function chainProfileFor(chains: string[]): ChainProfile {
-  const hasSolana = chains.includes('Solana');
-  const hasEthereum = chains.includes('Ethereum');
-  const l2s = chains.filter((c) => EVM_L2_CHAINS.has(c));
-
-  // Respect the protocol's own chain ordering between the two low-fee classes:
-  // Solana is the primary chain whenever it is listed ahead of every low-fee EVM
-  // chain (or none is listed). A minor L2 named later in the list must not jump
-  // ahead of a major low-fee chain the protocol itself lists earlier.
-  const firstL2 = l2s[0];
-  const solanaIndex = chains.indexOf('Solana');
-  const firstL2Index = firstL2 !== undefined ? chains.indexOf(firstL2) : -1;
-
-  if (hasSolana && (firstL2 === undefined || solanaIndex < firstL2Index)) {
-    const rawSecondary =
-      l2s[0] ?? (hasEthereum ? 'Ethereum' : chains.find((c) => c !== 'Solana') ?? null);
-    return {
-      primaryChain: 'Solana',
-      secondaryChain: rawSecondary ? displayChain(rawSecondary) : null,
-      gasBudget: 'about $1/month',
-      chainNote: 'Solana fees keep frequent weekly actions inexpensive',
-    };
-  }
-
-  if (l2s.length > 0) {
-    const rawPrimary = l2s[0]!;
-    const rawSecondary =
-      l2s[1] ?? (hasEthereum ? 'Ethereum' : chains.find((c) => c !== rawPrimary) ?? null);
-    const primary = displayChain(rawPrimary);
-    return {
-      primaryChain: primary,
-      secondaryChain: rawSecondary ? displayChain(rawSecondary) : null,
-      gasBudget: '$1-$5/month',
-      chainNote: hasEthereum
-        ? `preferring ${primary} over Ethereum mainnet cuts gas from $15-$40/month down to $1-$5/month`
-        : `${primary} execution keeps routine transactions cheap`,
-    };
-  }
-
-  if (hasEthereum) {
-    const rawSecondary = chains.find((c) => c !== 'Ethereum') ?? null;
-    return {
-      primaryChain: 'Ethereum',
-      secondaryChain: rawSecondary ? displayChain(rawSecondary) : null,
-      gasBudget: '$15-$40/month',
-      chainNote: 'batch Ethereum mainnet transactions during off-peak gas windows',
-    };
-  }
-
-  const rawPrimary = chains[0] ?? 'its primary chain';
-  const rawSecondary = chains[1] ?? null;
-  const primary = displayChain(rawPrimary);
-  const isBitcoin = rawPrimary === 'Bitcoin';
-  return {
-    primaryChain: primary,
-    secondaryChain: rawSecondary ? displayChain(rawSecondary) : null,
-    gasBudget: isBitcoin ? '$5-$15/month' : '$1-$5/month',
-    chainNote: isBitcoin
-      ? 'batch Bitcoin transactions during lower mempool fee windows'
-      : `${primary} network fees keep weekly usage low cost`,
-  };
-}
-
-function horizonFor(ageDays: number | null): { span: string; adj: string } {
-  if (ageDays !== null && ageDays < 180) return { span: '10-12 weeks', adj: '10-12 week' };
-  if (ageDays !== null && ageDays > 730) return { span: '8-10 weeks', adj: '8-10 week' };
-  return { span: '8-12 weeks', adj: '8-12 week' };
-}
-
-function ensureStepLength(text: string): string {
-  const trimmed = text.replace(/\s+/g, ' ').trim();
-  if (trimmed.length > 600) return `${trimmed.slice(0, 597)}...`;
-  if (trimmed.length < 20) return `${trimmed} Log date, wallet, and gas spent.`;
-  return trimmed;
-}
-
-function establishedProductKind(protocol: SnapshotProtocol): string {
-  const cat = protocol.category ?? '';
-  if (cat === 'CEX' || EXCHANGE_PREFIX_PATTERN.test(protocol.name)) {
-    return 'an exchange-backed or custodial product';
-  }
-  if (cat === 'Bridge' || cat === 'Canonical Bridge') {
-    return 'a wrapped or bridged asset product';
-  }
-  if (
-    cat === 'Liquid Staking' ||
-    cat === 'Liquid Restaking' ||
-    cat === 'Restaked BTC' ||
-    ESTABLISHED_WORD_PATTERN.test(protocol.name)
-  ) {
-    return 'a wrapped or staked token product';
-  }
-  if (VERSION_SUFFIX_PATTERN.test(protocol.name)) {
-    return 'a versioned deployment of an established protocol';
-  }
-  return 'an established wrapped, staked, or exchange product';
-}
-
-/** Deterministic per-protocol rotation seed (djb2 over the slug); stable across runs, no randomness. */
-function slugSeed(slug: string): number {
-  let h = 5381;
-  for (let i = 0; i < slug.length; i++) {
-    h = ((h * 33) ^ slug.charCodeAt(i)) >>> 0;
-  }
-  return h;
-}
-
-/** Pick one of several step phrasings deterministically from a seed. */
-function pickVariant(variants: readonly string[], seed: number): string {
-  return variants[seed % variants.length]!;
-}
-
-/**
- * Generate exactly 6 concrete, plain-text farm steps derived strictly from category, chains,
- * TVL tier, listing age, and launch eligibility. No URLs and no unverified protocol-specific claims.
- * Steps 3–6 rotate between two phrasings per branch on a deterministic per-protocol seed and
- * weave in the protocol's own 7-day momentum, so plans inside one category/age bucket still
- * differ in tactic and detail instead of repeating one template word-for-word.
- */
-export function buildFarmSteps(
-  protocol: SnapshotProtocol,
-  ageDays: number | null,
-  established: boolean,
-): string[] {
-  const tier = capitalTierFor(protocol.tvl_usd);
-  const cp = chainProfileFor(protocol.chains);
-  const horizon = horizonFor(ageDays);
-  const cat = protocol.category ?? 'Default';
-  const name = protocol.name;
-  const routeNote =
-    cp.secondaryChain !== null
-      ? `${cp.primaryChain} and ${cp.secondaryChain}`
-      : `${cp.primaryChain} and a major hub network`;
-
-  // Per-protocol rotation and momentum context for steps 3–6.
-  const seed = slugSeed(protocol.slug);
-  const changeTxt =
-    protocol.change_7d === null
-      ? null
-      : `${protocol.change_7d >= 0 ? '+' : ''}${protocol.change_7d.toFixed(1)}%`;
-  const momentumNote =
-    protocol.change_7d === null
-      ? 'no 7-day TVL change is recorded for it in the snapshot'
-      : protocol.change_7d >= 10
-        ? `7-day TVL momentum is a strong ${changeTxt}`
-        : protocol.change_7d <= -10
-          ? `7-day TVL momentum is a weak ${changeTxt}`
-          : `7-day TVL momentum is ${changeTxt}`;
-
-  let steps: string[];
-
-  if (established) {
-    const kind = establishedProductKind(protocol);
-    steps = [
-      `No launch to farm: ${name} is ${kind} tracking a token that already trades, so do not commit airdrop-hunting capital here; treat it purely as an exposure tool and keep monitoring to 5 minutes/week.`,
-      `Only use ${name} if you already want underlying asset custody, liquidity, or staking yield, sizing any voluntary allocation conservatively at ${tier.sizeRange} (${tier.tierLabel} tier) rather than chasing speculative points.`,
-      pickVariant(
-        [
-          `If you hold or move exposure on ${cp.primaryChain}, keep transaction overhead inside a ${cp.gasBudget} gas budget (${cp.chainNote}) and avoid unnecessary deposits, withdrawals, or bridge round-trips.`,
-          `Batch any unavoidable transfers on ${cp.primaryChain} into a single weekly window (5 minutes/week) so overhead stays inside the ${cp.gasBudget} gas budget (${cp.chainNote}) instead of leaking fees on every small move.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `Before minting, staking, or bridging through ${name}, compare secondary-market spread against native mint or redemption fees (10 minutes) so slippage does not outweigh the underlying yield.`,
-          `Check the peg or redemption discount on ${name} against its underlying asset once a week (5 minutes/week); a widening discount is your signal to exit via the cheapest route rather than hold on habit.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Review peg stability, custody or validator risk, and withdrawal queues once a week (5 minutes/week over the ${horizon.adj} holding period) rather than assuming passive holding earns an unannounced token.`,
-          `Once a week (5 minutes/week), scan for issuer or custodian announcements on ${name}; with ${momentumNote}, quiet weeks need no action beyond confirming the peg and your exit route over the ${horizon.adj} holding period.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Keep a lean log of entry cost, fees, and yield (5 minutes/month), and direct active farming hours toward unlaunched candidates carrying a full 1.00x launch-eligibility factor.`,
-          `Revisit this position monthly (5 minutes/month): if ${name} still offers no launch path, keep exposure minimal and let unlaunched candidates with a full 1.00x launch-eligibility factor absorb your active farming time.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  } else if (cat === 'CEX' || cat === 'CeDeFi') {
-    steps = [
-      `Low-priority skip plan: ${name} is classified as ${cat}, where custodial balances rarely earn a retroactive onchain token airdrop; keep this behind pure DeFi targets and cap time at 5 minutes/week.`,
-      `Do not park idle capital strictly to farm ${name}; if you already hold an account, limit optional activity to ${tier.sizeRange} (${tier.tierLabel} tier) only when you genuinely need execution.`,
-      pickVariant(
-        [
-          `Keep onchain transfers minimal on ${cp.primaryChain} (${cp.gasBudget} gas budget; ${cp.chainNote}) rather than cycling deposits and withdrawals that erode capital in fees.`,
-          `If you must move funds, route a single monthly transfer on ${cp.primaryChain} rather than weekly cycles (${cp.gasBudget} gas budget; ${cp.chainNote}); frequency earns nothing on a custodial venue.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `If ${name} launches an opt-in product or any points or season programme it runs, spend 5 minutes/week checking eligibility rules before committing fresh funds over the ${horizon.adj} window.`,
-          `Once a month (10 minutes), audit what ${name} actually offers holders — earn products, fee tiers, withdrawal terms — and only opt in when the utility stands on its own without any airdrop assumption.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Prioritize self-custody protocols from higher-multiple categories first, and avoid KYC-gated lockups on ${name} unless net trading or yield utility justifies the commitment on its own.`,
-          `Re-rank ${name} monthly against your DeFi targets: because ${momentumNote}, custodial TVL swings say little about a future token, so keep it last in the queue across the ${horizon.adj} window.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Record any account funding dates and fees in a simple spreadsheet (5 minutes/month) so you can unwind cleanly without mistaking exchange balances for active DeFi farm exposure.`,
-          `Keep one page of records (5 minutes/month): account funding dates, balances, and every fee charged, so any future eligibility snapshot can be matched against your own history.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  } else if (cat === 'Dexs' || cat === 'Liquidity Manager') {
-    steps = [
-      `Prepare a dedicated wallet on ${cp.primaryChain} funded with ${tier.sizeRange} (${tier.tierLabel} tier; ${tier.splitNote}) plus a ${cp.gasBudget} gas buffer (${cp.chainNote}); setup takes 10 minutes.`,
-      `Execute 2-3 organic spot swaps per week on ${name} across major pairs (10-15 minutes/week) to build consistent volume and distinct active weeks rather than one-off wash trades.`,
-      pickVariant(
-        [
-          `Provide ${tier.sizeRange} into a deep, blue-chip liquidity pool on ${name} on ${cp.primaryChain} and keep the LP position active so resting liquidity is captured across snapshots.`,
-          `Split the LP side across two fee tiers or two major pairs on ${name} rather than one pool, so your ${tier.sizeRange} keeps earning through volatility instead of sitting out of range in a single position.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `Rebalance or collect accrued swap fees every 2 weeks (15 minutes per review, within your ${cp.gasBudget} gas budget) to maintain active-range utilization and avoid stale out-of-range positions.`,
-          `Every week (10 minutes/week), compare your pool's fee APR on ${name} against the pair's volume trend; with ${momentumNote}, shift range only when volume — not price noise — justifies the gas.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Maintain the swap-and-LP cadence for ${horizon.span}, checking weekly (5 minutes/week) whether positions qualify for any points or season programme it runs without chasing risky micro-cap pools.`,
-          `Keep both swaps and LP running for ${horizon.span}; because ${momentumNote}, resist raising size after strong weeks and let consistent active weeks — not one big week — build the record.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Track swap volume, LP entry prices, impermanent loss, and cumulative gas in a farm log (5 minutes/week) before deciding whether to compound or unwind after the ${horizon.adj} cycle.`,
-          `Log each week's swap count, LP fees earned, and impermanent loss versus simply holding (5 minutes/week); exit the ${horizon.adj} cycle only if net fees beat the hold benchmark after gas.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  } else if (
-    cat === 'Lending' ||
-    cat === 'Uncollateralized Lending' ||
-    cat === 'Collateral Markets' ||
-    cat === 'CDP' ||
-    cat === 'CDP Manager'
-  ) {
-    steps = [
-      `Fund a dedicated wallet on ${cp.primaryChain} with ${tier.sizeRange} in a liquid collateral asset (${tier.tierLabel} tier; ${tier.splitNote}) and reserve ${cp.gasBudget} for gas (${cp.chainNote}); 10 minutes setup.`,
-      `Supply your ${tier.sizeRange} collateral to a core ${name} market on ${cp.primaryChain} and verify that supply receipts and interest accrual update cleanly onchain (10 minutes).`,
-      pickVariant(
-        [
-          `Borrow conservatively against your supply — keep loan-to-value at 30%-45% with a wide liquidation buffer — so your wallet records both lender and borrower usage on ${name}.`,
-          `Split the borrow leg: draw a smaller tranche at 20%-30% loan-to-value in a second asset or market on ${name} so your usage spans more than one market without pushing overall liquidation risk higher.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `Run a disciplined repay-and-reborrow or partial-top-up cycle every 1-2 weeks (10-15 minutes/week within your ${cp.gasBudget} gas budget) while checking health factor whenever volatility spikes.`,
-          `Set a weekly health-factor check (10 minutes/week): if the factor drifts under 1.6, repay the riskiest tranche first; if it sits above 2.5, a modest top-up keeps the loop active inside your ${cp.gasBudget} gas budget.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Hold the active supply-and-borrow loop for ${horizon.span}, spending 5 minutes/week monitoring borrow APR vs supply yield and verifying eligibility for any points or season programme it runs.`,
-          `Sustain the supply-and-borrow loop for ${horizon.span}; because ${momentumNote}, let interest-rate spreads — not TVL headlines — decide whether the borrow leg stays open each week.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Maintain a position log with collateral ratio, net borrow interest, and gas spend (5 minutes/week), and repay the debt in full before withdrawing collateral at the end of the ${horizon.adj} window.`,
-          `Record net interest (supply yield minus borrow cost), liquidation-buffer history, and gas weekly (5 minutes/week); unwind at the end of the ${horizon.adj} window only after the borrow is fully repaid and receipts are withdrawn.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  } else if (
-    cat === 'Derivatives' ||
-    cat === 'Interest Rate Derivatives' ||
-    cat === 'Options' ||
-    cat === 'Options Vault' ||
-    cat === 'Basis Trading' ||
-    cat === 'Prediction Market'
-  ) {
-    steps = [
-      `Deposit ${tier.sizeRange} of stable margin into a fresh wallet for ${name} on ${cp.primaryChain} (${tier.tierLabel} tier; ${tier.splitNote}) and budget ${cp.gasBudget} for gas (${cp.chainNote}); 10 minutes setup.`,
-      `Open small, low-leverage (1x-2x) hedged perpetual or derivative positions on liquid markets inside ${name}, pairing exposure against spot or an offsetting leg to keep directional risk tight.`,
-      pickVariant(
-        [
-          `Place 2-4 measured trades per week (15-20 minutes/week) and let positions stay open for at least several hours so activity reflects genuine open interest rather than instant round-trips.`,
-          `Alternate instruments week to week on ${name} — perps one week, options or rate products the next where offered — so your history shows breadth of genuine usage rather than a single repeated trade.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `Cap weekly trading fees and funding drag below 1% of your ${tier.sizeRange} margin, keeping onchain settlement within the ${cp.gasBudget} gas allowance on ${cp.primaryChain}.`,
-          `Review funding rates before each session (10 minutes/week): skip weeks when funding on your side of the trade runs hot, since ${momentumNote} and expensive carry erase thin farming gains.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Sustain weekly trading and margin activity for ${horizon.span}, checking once a week (5 minutes/week) how volume and open interest count toward any points or season programme it runs.`,
-          `Trade through ${horizon.span} without a gap longer than one week; because ${momentumNote}, keep position size flat across hot and cold weeks so the activity record reads as steady participation.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Log realized PnL, funding paid, trading fees, and open-interest days weekly (5 minutes/week), then flatten hedges cleanly before withdrawing margin after the ${horizon.adj} horizon.`,
-          `Log margin balance, fee-to-volume ratio, and days with open interest each week (5 minutes/week); flatten and withdraw after the ${horizon.adj} horizon if fees consumed more than the positions earned.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  } else if (
-    cat === 'Yield' ||
-    cat === 'Yield Aggregator' ||
-    cat === 'Risk Curators' ||
-    cat === 'Onchain Capital Allocator' ||
-    cat === 'Farm' ||
-    cat === 'Leveraged Farming' ||
-    cat === 'Indexes'
-  ) {
-    const isCurator = cat === 'Risk Curators' || cat === 'Onchain Capital Allocator';
-    steps = [
-      `Set up a dedicated wallet on ${cp.primaryChain} with ${tier.sizeRange} (${tier.tierLabel} tier; ${tier.splitNote}) and allocate ${cp.gasBudget} for gas (${cp.chainNote}); takes 10 minutes.`,
-      isCurator
-        ? `Deposit ${tier.sizeRange} into one of ${name}'s flagship curated vaults on ${cp.primaryChain} after checking underlying lending markets, collateral caps, and curator performance fees (10-15 minutes).`
-        : `Deposit ${tier.sizeRange} into one of ${name}'s primary audited vaults on ${cp.primaryChain} with healthy TVL and transparent underlying strategies (10-15 minutes initial deposit).`,
-      pickVariant(
-        [
-          `Leave vault shares staked or compounding continuously rather than hopping vaults daily, adding a small weekly top-up or harvest action (10 minutes/week) to register recurring activity.`,
-          `Claim and restake accrued yield every week (10 minutes/week) instead of letting rewards sit idle, so the wallet shows continuous compounding activity on ${cp.primaryChain}.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `Review strategy APY, withdrawal queue terms, and collateral composition once a week (10 minutes/week) while keeping maintenance transactions inside your ${cp.gasBudget} gas budget.`,
-          `Compare ${name}'s vault APY against its own recent average and the underlying markets once a week (10 minutes/week), and rotate only if a shortfall persists across two straight reviews.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Hold the compounding vault position across ${horizon.span} so time-weighted balance snapshots accumulate under any points or season programme it runs.`,
-          `Hold the compounding vault position across ${horizon.span}; because ${momentumNote}, avoid chasing size increases after strong weeks and let time-weighted balance do the work.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Record vault share price, net yield earned, and total gas costs weekly (5 minutes/week) so you can measure true net return before unwinding after ${horizon.span}.`,
-          `Log entry share price, weekly yield, and cumulative gas (5 minutes/week) and pre-set your exit rule: unwind after ${horizon.span} unless the position still clears your hurdle rate after fees.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  } else if (cat === 'Bridge' || cat === 'Canonical Bridge' || cat === 'Cross Chain Bridge') {
-    steps = [
-      `Allocate ${tier.sizeRange} of liquid stablecoins or native assets (${tier.tierLabel} tier; ${tier.splitNote}) and a ${cp.gasBudget} gas budget (${cp.chainNote}) in a dedicated bridging wallet; 10 minutes setup.`,
-      `Route 1-2 genuine cross-chain transfers per week through ${name} between ${routeNote} (10-15 minutes/week) to build recurring bridge volume across distinct source and destination chains.`,
-      pickVariant(
-        [
-          `Vary transfer sizes naturally within your ${tier.sizeRange} band and leave bridged funds on the destination chain for several days before bridging back so flows look organic.`,
-          `Alternate direction and route each week — send via ${routeNote} one week and return by a different corridor the next — so volume is not a single repeated round-trip pattern.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `Check quoted slippage and relayer fees before every transfer so combined bridge fees and ${cp.gasBudget} gas stay well controlled across ${protocol.chains.length} supported chain${protocol.chains.length === 1 ? '' : 's'}.`,
-          `Before each transfer, compare ${name}'s quote against one alternative route (5 minutes); if fees differ materially, split the transfer so most volume still lands on ${name} at a fair price.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Continue steady cross-chain volume over ${horizon.span}, spending 5 minutes/week verifying transaction completion and checking eligibility under any points or season programme it runs.`,
-          `Keep weekly transfers going for ${horizon.span}; because ${momentumNote}, hold transfer size steady and let distinct active weeks accumulate instead of front-loading volume.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Log source chain, destination chain, bridged USD volume, and fees per transfer (5 minutes/week) to track cumulative volume without stranding dust balances across networks.`,
-          `Maintain a route ledger — date, corridor, USD value, fee paid, completion time (5 minutes/week) — across all ${protocol.chains.length} supported chains, and consolidate dust balances monthly.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  } else if (cat === 'RWA') {
-    steps = [
-      `Check ${name}'s jurisdiction, accreditation, and KYC/onboarding requirements first (15 minutes) before moving funds, since RWA issuers often restrict minting or redemption to verified wallets.`,
-      `Fund an approved wallet on ${cp.primaryChain} with ${tier.sizeRange} in supported stablecoins (${tier.tierLabel} tier; ${tier.splitNote}) plus ${cp.gasBudget} for gas (${cp.chainNote}).`,
-      pickVariant(
-        [
-          `Mint or deposit into ${name}'s core tokenized yield asset on ${cp.primaryChain} and confirm the balance settles properly in your wallet (15 minutes).`,
-          `Stage the deposit in two tranches a week apart (${tier.sizeRange} total) so both a mint and a follow-on top-up appear in your wallet history on ${cp.primaryChain}.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `Hold the RWA balance continuously and perform light weekly maintenance — checking yield accrual, redemption windows, or secondary liquidity (10 minutes/week within ${cp.gasBudget} gas).`,
-          `Verify each week (10 minutes/week) that distributions or yield accruals actually landed in the approved wallet; a missing accrual is an onboarding or whitelist problem to fix early, not at redemption.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Maintain the deposit for ${horizon.span} so holding duration counts across snapshots and any points or season programme it runs, while confirming T+0/T+1 exit liquidity before scaling up.`,
-          `Maintain the deposit for ${horizon.span}; because ${momentumNote}, treat RWA momentum as secondary — redemption terms and issuer reporting discipline matter more than one strong week.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Keep a clean compliance and yield log (deposit timestamps, KYC wallet address, accrued yield, and gas; 5 minutes/week) to simplify tax reporting and eventual redemption.`,
-          `Keep the compliance file current (5 minutes/week): KYC wallet, deposit confirmations, yield statements, and the redemption notice period, so exit at the end of ${horizon.span} is a formality.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  } else if (
-    cat === 'Liquid Staking' ||
-    cat === 'Liquid Restaking' ||
-    cat === 'Restaking' ||
-    cat === 'Staking Pool' ||
-    cat === 'Restaked BTC' ||
-    cat === 'Decentralized BTC' ||
-    cat === 'Anchor BTC'
-  ) {
-    steps = [
-      `Prepare a fresh wallet on ${cp.primaryChain} holding ${tier.sizeRange} of the native staking asset (${tier.tierLabel} tier; ${tier.splitNote}) plus ${cp.gasBudget} for gas (${cp.chainNote}); 10 minutes setup.`,
-      `Stake ${tier.sizeRange} directly through ${name}'s minting contract on ${cp.primaryChain} rather than only swapping on a secondary DEX so the protocol records a direct staking deposit (10 minutes).`,
-      pickVariant(
-        [
-          `Put the minted receipt token to work productively — hold it in your wallet or supply it to a conservative lending or liquidity venue on ${cp.primaryChain} without taking excess leverage.`,
-          `Keep half the receipt tokens liquid in-wallet and supply only the other half to a conservative venue on ${cp.primaryChain}, balancing productive use against a fast exit if the peg slips.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `Check staking yield, receipt-token peg discount, and unbonding queue length once per week (10 minutes/week), keeping any restaking or claim actions inside your ${cp.gasBudget} gas budget.`,
-          `Track the receipt token's secondary-market discount weekly (10 minutes/week): a discount beyond 1% is a signal to prefer the native unstaking queue over a market exit.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Hold the staked position continuously for ${horizon.span} to build unbroken time-weighted balance for any points or season programme it runs.`,
-          `Hold the staked position continuously for ${horizon.span}; because ${momentumNote}, do not lever the receipt token after strong weeks — unbroken holding time is the metric that matters here.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Log mint rate, staking APY, receipt deployments, and gas spend weekly (5 minutes/week), and compare instant-swap exit vs native unstaking queue before unwinding after ${horizon.span}.`,
-          `Log mint rate, APY drift, and any queue waits weekly (5 minutes/week), and decide the exit — instant swap versus native unstake — before the ${horizon.adj} period ends, not after.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  } else {
-    steps = [
-      `Fund a dedicated wallet on ${cp.primaryChain} with ${tier.sizeRange} (${tier.tierLabel} tier; ${tier.splitNote}) and keep ${cp.gasBudget} reserved for gas (${cp.chainNote}); 10 minutes setup.`,
-      `Complete one core product action on ${name} on ${cp.primaryChain} — depositing, transacting, or opening a primary position — so your wallet registers authentic first-party usage (15 minutes).`,
-      pickVariant(
-        [
-          `Return once per week for 10-15 minutes to perform a meaningful core interaction on ${name} (such as topping up, transacting, or rebalancing) rather than leaving the wallet dormant.`,
-          `Vary the weekly interaction on ${name} — alternate between a deposit-style action, a transaction, and a governance or settings touch (10-15 minutes/week) so usage reads as genuine product exploration.`,
-        ],
-        seed + 3,
-      ),
-      pickVariant(
-        [
-          `Keep onchain activity disciplined within your ${cp.gasBudget} gas budget on ${cp.primaryChain}${cp.secondaryChain ? ` (optionally testing ${cp.secondaryChain} as a second active chain)` : ''}.`,
-          `Review your activity monthly (10 minutes): confirm transactions on ${cp.primaryChain} actually registered in the product's interface, and note that ${momentumNote} before deciding whether to raise or hold size.`,
-        ],
-        seed + 4,
-      ),
-      pickVariant(
-        [
-          `Sustain weekly usage and an active balance across ${horizon.span}, spending 5 minutes/week verifying whether ongoing usage qualifies under any points or season programme it runs.`,
-          `Sustain weekly usage and an active balance across ${horizon.span}; because ${momentumNote}, consistency of active weeks outweighs transaction size for a protocol with no announced programme.`,
-        ],
-        seed + 5,
-      ),
-      pickVariant(
-        [
-          `Document wallet address, transaction dates, active balance, and cumulative gas in a farm log (5 minutes/week) so you can cleanly review or unwind after the ${horizon.adj} period.`,
-          `Keep the farm log lean (5 minutes/week) — wallet, dates, action type, balance after, gas paid — and do a full review at the end of the ${horizon.adj} period before committing another cycle.`,
-        ],
-        seed + 6,
-      ),
-    ];
-  }
-
-  return steps.map(ensureStepLength);
-}
-
-/** Parse and validate snapshot.json text into a strongly typed Snapshot. */
-export function parseSnapshot(text: string): Snapshot {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(text);
-  } catch {
-    throw new SnapshotError('snapshot.json is not valid JSON');
-  }
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    throw new SnapshotError('snapshot.json root must be an object');
-  }
-  const obj = raw as Record<string, unknown>;
-  if (typeof obj.as_of !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(obj.as_of)) {
-    throw new SnapshotError('snapshot.json is missing a valid YYYY-MM-DD as_of date');
-  }
-  if (typeof obj.source !== 'string' || obj.source.length === 0) {
-    throw new SnapshotError('snapshot.json is missing source');
-  }
-  if (typeof obj.floor_usd !== 'number' || !Number.isSafeInteger(obj.floor_usd) || obj.floor_usd <= 0) {
-    throw new SnapshotError('snapshot.json is missing a positive integer floor_usd');
-  }
-  if (!Array.isArray(obj.protocols)) {
-    throw new SnapshotError('snapshot.json is missing protocols array');
-  }
-  if (!Array.isArray(obj.watchlist) || obj.watchlist.some((w) => typeof w !== 'string')) {
-    throw new SnapshotError('snapshot.json is missing watchlist string array');
-  }
-
-  const protocols: SnapshotProtocol[] = obj.protocols.map((entry, idx) => {
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
-      throw new SnapshotError(`snapshot.json protocol[${idx}] is not an object`);
-    }
-    const p = entry as Record<string, unknown>;
-    if (
-      typeof p.slug !== 'string' ||
-      p.slug.length === 0 ||
-      typeof p.name !== 'string' ||
-      p.name.length === 0 ||
-      typeof p.tvl_usd !== 'number' ||
-      !Number.isFinite(p.tvl_usd) ||
-      p.tvl_usd < 0
-    ) {
-      throw new SnapshotError(`snapshot.json protocol[${idx}] lacks valid slug, name, or tvl_usd`);
-    }
-    return {
-      slug: p.slug,
-      name: p.name,
-      category: typeof p.category === 'string' ? p.category : null,
-      chains: Array.isArray(p.chains)
-        ? p.chains.filter((c): c is string => typeof c === 'string')
-        : [],
-      tvl_usd: p.tvl_usd,
-      change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
-      mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
-      listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
-      gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
-      symbol: typeof p.symbol === 'string' ? p.symbol : null,
-    };
-  });
-
-  return {
-    as_of: obj.as_of,
-    source: obj.source,
-    floor_usd: obj.floor_usd,
-    protocols,
-    watchlist: obj.watchlist as string[],
-  };
-}
-
-/** Build the ranked pre-token board and offline dashboard dataset from a snapshot. */
-export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
-  const watchlistSet = new Set(snapshot.watchlist);
-  const preTokenProtocols = snapshot.protocols.filter(isPreToken);
-
-  const scored = preTokenProtocols.map((p) => {
-    const result = scoreProtocol(p, snapshot.as_of);
-    return {
-      protocol: p,
-      age_days: result.age_days,
-      established: result.established,
-      factors: result.factors,
-      implied_value_usd: result.implied_value_usd,
-    };
-  });
-
-  // Sort by implied value descending, ties by slug ascending.
   scored.sort(
     (a, b) =>
-      b.implied_value_usd - a.implied_value_usd ||
-      compareSlug(a.protocol.slug, b.protocol.slug),
+      b.impliedValue - a.impliedValue || compareSlug(a.protocol.slug, b.protocol.slug),
   );
 
   // Enforce strictly decreasing implied values down the ranked board.
   for (let i = 1; i < scored.length; i++) {
-    const prev = scored[i - 1]!.implied_value_usd;
-    const curr = scored[i]!.implied_value_usd;
-    if (curr >= prev) {
-      scored[i]!.implied_value_usd = Math.max(1, prev - 1);
+    const prev = scored[i - 1].impliedValue;
+    if (scored[i].impliedValue >= prev) {
+      scored[i].impliedValue = Math.max(1, prev - 1);
     }
   }
 
-  const board: BoardRow[] = scored.map((entry, idx) => {
-    const p = entry.protocol;
-    return {
-      rank: idx + 1,
-      slug: p.slug,
-      name: p.name,
-      category: p.category,
-      chains: p.chains,
-      tvl_usd: p.tvl_usd,
-      change_7d: p.change_7d,
-      mcap_usd: p.mcap_usd,
-      listed_at: p.listed_at,
-      gecko_id: p.gecko_id,
-      symbol: p.symbol,
-      age_days: entry.age_days,
-      watchlist: watchlistSet.has(p.slug),
-      established: entry.established,
-      implied_value_usd: entry.implied_value_usd,
-      factors: entry.factors,
-      farm_steps: buildFarmSteps(p, entry.age_days, entry.established),
-    };
-  });
-
-  const rows: RadarRow[] = board.map((r) => ({
-    rank: r.rank,
-    slug: r.slug,
-    name: r.name,
-    category: r.category,
-    chains: r.chains,
-    tvl_usd: r.tvl_usd,
-    change_7d: r.change_7d,
-    age_days: r.age_days,
-    watchlist: r.watchlist,
-    established: r.established,
-    implied_value_usd: r.implied_value_usd,
-    factors: r.factors,
-    farm_steps: r.farm_steps,
+  const rows: RadarRow[] = scored.map((entry, index) => ({
+    rank: index + 1,
+    slug: entry.protocol.slug,
+    name: entry.protocol.name,
+    category: entry.protocol.category,
+    chains: entry.protocol.chains.slice(),
+    tvl_usd: entry.protocol.tvl_usd,
+    change_7d: entry.protocol.change_7d,
+    age_days: entry.ageDays,
+    watchlist: watchlist.has(entry.protocol.slug),
+    established: entry.established,
+    implied_value_usd: entry.impliedValue,
+    factors: entry.factors,
+    farm_steps: buildFarmSteps(
+      entry.protocol,
+      entry.established,
+      entry.reason,
+      entry.ageDays,
+    ),
   }));
 
-  const radar: RadarData = {
+  return {
     meta: {
       as_of: snapshot.as_of,
       floor_usd: snapshot.floor_usd,
       scanned: snapshot.protocols.length,
-      pre_token: board.length,
+      pre_token: rows.length,
       watchlist_count: snapshot.watchlist.length,
     },
     rows,
   };
-
-  return { board, radar };
 }
 
-/** Validate every gate invariant on a generated board; returns an issue description or null. */
-export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
-  if (board.length < 100 || board.length > 4000) {
-    return `board has ${board.length} rows; expected between 100 and 4000`;
+// ---------------------------------------------------------------------------
+// boardIssue: the published gate shape, checked before anything is written.
+// Returns a human-readable issue string, or null when the board is valid.
+// ---------------------------------------------------------------------------
+export function boardIssue(rows: RadarRow[], snapshot: Snapshot): string | null {
+  if (!Array.isArray(rows) || rows.length < 100 || rows.length > 4000) {
+    return "board must hold 100 to 4000 rows, holds " + (rows ? rows.length : 0);
   }
-
-  const snapshotSlugs = new Set(snapshot.protocols.map((p) => p.slug));
-  const watchlistSet = new Set(snapshot.watchlist);
-  const seenSlugs = new Set<string>();
-  let nonWatchlistCount = 0;
-
-  for (let i = 0; i < board.length; i++) {
-    const row = board[i]!;
-    if (!snapshotSlugs.has(row.slug)) {
-      return `row ${i + 1} slug "${row.slug}" is not present in the snapshot`;
-    }
-    if (seenSlugs.has(row.slug)) {
-      return `duplicate slug "${row.slug}" in board`;
-    }
-    seenSlugs.add(row.slug);
-
+  const known = new Map(snapshot.protocols.map((p) => [p.slug, p]));
+  const seen = new Set<string>();
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
     if (row.rank !== i + 1) {
-      return `row ${i + 1} (${row.slug}) has rank ${row.rank}; expected ${i + 1}`;
+      return "ranks must be exactly 1..N: row " + i + " claims rank " + row.rank;
     }
-
-    const v = row.implied_value_usd;
-    if (!Number.isSafeInteger(v) || v <= 0 || v > MAX_IMPLIED_VALUE) {
-      return `${row.slug} has invalid implied_value_usd ${v}`;
+    if (seen.has(row.slug)) return "duplicate slug on the board: " + row.slug;
+    seen.add(row.slug);
+    if (!known.has(row.slug)) return "slug is not a snapshot protocol: " + row.slug;
+    if (!Number.isInteger(row.implied_value_usd) || row.implied_value_usd <= 0) {
+      return "implied value must be a positive whole number: " + row.slug;
     }
-    if (i > 0 && v > board[i - 1]!.implied_value_usd) {
-      return `row ${i + 1} (${row.slug}, $${v}) exceeds previous row ($${board[i - 1]!.implied_value_usd})`;
+    if (row.implied_value_usd > MAX_IMPLIED_VALUE) {
+      return "implied value above the 1e14 cap: " + row.slug;
     }
-
-    if (!watchlistSet.has(row.slug)) {
-      nonWatchlistCount++;
+    if (i > 0 && row.implied_value_usd > rows[i - 1].implied_value_usd) {
+      return "implied values must not rise as rank ascends: " + row.slug;
     }
-
     if (!Array.isArray(row.farm_steps) || row.farm_steps.length < 3 || row.farm_steps.length > 12) {
-      return `${row.slug} has ${row.farm_steps?.length ?? 0} farm_steps; expected 3..12`;
+      return "farm_steps must hold 3 to 12 steps: " + row.slug;
     }
-    for (let s = 0; s < row.farm_steps.length; s++) {
-      const step = row.farm_steps[s];
-      if (typeof step !== 'string') {
-        return `${row.slug} farm_steps[${s}] is not a string`;
-      }
+    for (const step of row.farm_steps) {
       const trimmed = step.trim();
       if (trimmed.length < 20 || trimmed.length > 600) {
-        return `${row.slug} farm_steps[${s}] has trimmed length ${trimmed.length}; expected 20..600`;
-      }
-      if (URL_PATTERN.test(trimmed)) {
-        return `${row.slug} farm_steps[${s}] contains a URL`;
+        return "farm step outside 20..600 trimmed chars: " + row.slug;
       }
     }
   }
-
-  if (board.length >= 2 && board[0]!.implied_value_usd === board[board.length - 1]!.implied_value_usd) {
-    return `all ${board.length} rows share the same implied value $${board[0]!.implied_value_usd}`;
+  for (const slug of snapshot.watchlist) {
+    if (!seen.has(slug)) return "watchlist slug missing from the board: " + slug;
   }
-
-  const missingWatchlist = snapshot.watchlist.filter((slug) => !seenSlugs.has(slug));
-  if (missingWatchlist.length > 0) {
-    return `board misses ${missingWatchlist.length} watchlist slug(s): ${missingWatchlist.slice(0, 5).join(', ')}`;
+  const nonWatchlist = rows.filter((row) => !snapshot.watchlist.includes(row.slug)).length;
+  if (nonWatchlist < 60) {
+    return "board must hold at least 60 non-watchlist rows, holds " + nonWatchlist;
   }
-
-  if (nonWatchlistCount < 60) {
-    return `board has only ${nonWatchlistCount} non-watchlist rows; expected at least 60`;
-  }
-
   return null;
 }
 
-/** Serialize the offline dashboard dataset as a single deterministic JS script. */
-export function dataScript(radar: RadarData): string {
-  return `window.RADAR = ${JSON.stringify(radar)};\n`;
+// ---------------------------------------------------------------------------
+// dataScript: the dashboard's data, as a classic script payload.
+// ---------------------------------------------------------------------------
+export function dataScript(radar: Radar): string {
+  const payload = JSON.stringify({ meta: radar.meta, rows: radar.rows });
+  return "window.RADAR = " + payload.replace(/<\//g, "<\\/") + ";\n";
 }

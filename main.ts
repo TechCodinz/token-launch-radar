@@ -1,120 +1,109 @@
-// Deterministic CLI runner for token-launch-radar (Node 22+ standard library only).
-// Reads a sealed DefiLlama snapshot, ranks every pre-token protocol via lib/model.ts,
-// validates all board invariants, writes board.json and data.js, copies dashboard/ and
-// screenshots/ into the output directory, and seals dossier.json last.
+// Token Launch Radar - entrypoint.
+//
+// Reads the sealed snapshot, builds the ranked board with lib/model.ts,
+// refuses to write anything if the board fails its own gate shape, then
+// writes board.json and data.js, copies dashboard/ and screenshots/ into
+// the output directory, and writes dossier.json LAST with the vendored
+// buildDossier. Node 22 standard library only; no network, no clock, no
+// randomness - two runs over the same snapshot write identical bytes.
 
 import {
   copyFileSync,
-  existsSync,
   mkdirSync,
-  readFileSync,
   readdirSync,
+  readFileSync,
   statSync,
   writeFileSync,
-} from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
-import { PLAIN_NAME, buildDossier } from './vendor/makefun-board.ts';
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { boardIssue, buildRadar, dataScript, parseSnapshot } from "./lib/model.ts";
+import { buildDossier } from "./vendor/makefun-board.ts";
 
-const ROOT_DIR = fileURLToPath(new URL('.', import.meta.url));
-
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PLAIN_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const DOSSIER_CAPS = {
-  text_max_bytes: 65_536,
-  screenshots: { max: 4, max_bytes: 524_288 },
-  dashboard: { max_files: 400, max_bytes: 4_194_304 },
+  text_max_bytes: 65536,
+  screenshots: { max: 4, max_bytes: 524288 },
+  dashboard: { max_files: 400, max_bytes: 4194304 },
 };
 
-function readArg(flag: string, fallback: string): string {
-  const argv = process.argv.slice(2);
-  for (let i = 0; i < argv.length; i++) {
-    const token = argv[i]!;
-    if (token === `--${flag}` && i + 1 < argv.length) {
-      return argv[i + 1]!;
-    }
-    if (token.startsWith(`--${flag}=`)) {
-      return token.slice(flag.length + 3);
-    }
-  }
-  return fallback;
+function argValue(args: string[], name: string): string | null {
+  const index = args.indexOf(name);
+  if (index === -1 || index + 1 >= args.length) return null;
+  return args[index + 1];
 }
 
-function resolveSnapshotPath(inputArg: string): string {
-  if (inputArg.endsWith('.json')) return inputArg;
-  if (existsSync(inputArg) && statSync(inputArg).isFile()) return inputArg;
-  return join(inputArg, 'snapshot.json');
+function snapshotPathFor(input: string): string {
+  const resolved = resolve(input);
+  return statSync(resolved).isDirectory() ? join(resolved, "snapshot.json") : resolved;
 }
 
-function copyDirectoryFiles(srcDir: string, dstDir: string): string[] {
-  if (!existsSync(srcDir)) return [];
-  mkdirSync(dstDir, { recursive: true });
-  const entries = readdirSync(srcDir)
-    .filter((name) => !name.startsWith('.'))
-    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-
-  const copied: string[] = [];
-  for (const name of entries) {
-    const srcPath = join(srcDir, name);
-    if (!statSync(srcPath).isFile()) continue;
-    copyFileSync(srcPath, join(dstDir, name));
-    copied.push(name);
+function copyDir(source: string, target: string): void {
+  mkdirSync(target, { recursive: true });
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (entry.name.startsWith(".")) continue;
+    const from = join(source, entry.name);
+    const to = join(target, entry.name);
+    if (entry.isDirectory()) copyDir(from, to);
+    else if (entry.isFile()) copyFileSync(from, to);
   }
-  return copied;
 }
 
 function main(): void {
-  const inputArg = readArg('input', '/input');
-  const snapshotPath = resolveSnapshotPath(inputArg);
-  if (!existsSync(snapshotPath)) {
-    process.stderr.write(`token-launch-radar: snapshot not found at ${snapshotPath}\n`);
-    process.exit(1);
-  }
+  const args = process.argv.slice(2);
+  const input = argValue(args, "--input") ?? "/input";
+  const output =
+    argValue(args, "--output") ?? process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+  const outDir = resolve(output);
 
-  const outDir = readArg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
+  const snapshot = parseSnapshot(readFileSync(snapshotPathFor(input), "utf8"));
+  const radar = buildRadar(snapshot);
 
-  const snapshotText = readFileSync(snapshotPath, 'utf8');
-  const snapshot = parseSnapshot(snapshotText);
-  const { board, radar } = buildRadar(snapshot);
-
-  const issue = boardIssue(board, snapshot);
+  const issue = boardIssue(radar.rows, snapshot);
   if (issue !== null) {
-    process.stderr.write(`token-launch-radar: board validation failed: ${issue}\n`);
+    console.error("board issue: " + issue);
     process.exit(1);
   }
 
   mkdirSync(outDir, { recursive: true });
-  writeFileSync(join(outDir, 'board.json'), `${JSON.stringify({ rows: board })}\n`, 'utf8');
-  writeFileSync(join(outDir, 'data.js'), dataScript(radar), 'utf8');
+  writeFileSync(
+    join(outDir, "board.json"),
+    JSON.stringify({ rows: radar.rows }, null, 2) + "\n",
+  );
+  writeFileSync(join(outDir, "data.js"), dataScript(radar));
 
-  const dashFiles = copyDirectoryFiles(join(ROOT_DIR, 'dashboard'), join(outDir, 'dashboard'));
-  if (dashFiles.length === 0) {
-    process.stderr.write('token-launch-radar: dashboard/ directory is missing or empty\n');
+  copyDir(join(HERE, "dashboard"), join(outDir, "dashboard"));
+
+  const shotsSource = join(HERE, "screenshots");
+  const shots = readdirSync(shotsSource).filter((name) => !name.startsWith("."));
+  if (shots.length < 3) {
+    console.error("screenshots: need at least 3, found " + shots.length);
     process.exit(1);
   }
-
-  const shotFiles = copyDirectoryFiles(join(ROOT_DIR, 'screenshots'), join(outDir, 'screenshots'));
-  if (shotFiles.length < 3) {
-    process.stderr.write(
-      `token-launch-radar: screenshots/ has ${shotFiles.length} file(s); at least 3 are required\n`,
-    );
-    process.exit(1);
-  }
-  for (const name of shotFiles) {
+  for (const name of shots) {
     if (!PLAIN_NAME.test(name)) {
-      process.stderr.write(
-        `token-launch-radar: invalid screenshot filename "${name}" (must match ${PLAIN_NAME})\n`,
-      );
+      console.error("screenshots: name is not plain: " + name);
       process.exit(1);
     }
   }
+  copyDir(shotsSource, join(outDir, "screenshots"));
 
-  // Write dossier.json strictly last from the assembled output directory.
-  const dossierBytes = buildDossier(outDir, DOSSIER_CAPS);
-  writeFileSync(join(outDir, 'dossier.json'), dossierBytes);
+  const dossier = buildDossier(outDir, DOSSIER_CAPS);
+  writeFileSync(join(outDir, "dossier.json"), dossier);
 
-  const top = board[0];
-  process.stdout.write(
-    `token-launch-radar: scanned ${radar.meta.scanned} protocols, ranked ${radar.meta.pre_token} pre-token (${radar.meta.watchlist_count} watchlist), #1 ${top?.name ?? 'n/a'} ($${top?.implied_value_usd.toLocaleString('en-US') ?? '0'}), wrote ${outDir} (${dashFiles.length} dashboard files, ${shotFiles.length} screenshots, dossier.json)\n`,
+  const top = radar.rows[0];
+  console.log(
+    "token launch radar: " +
+      radar.rows.length +
+      " pre-token of " +
+      radar.meta.scanned +
+      " scanned; top " +
+      top.slug +
+      " at $" +
+      top.implied_value_usd +
+      "; wrote board.json, data.js, dashboard/, screenshots/, dossier.json to " +
+      outDir,
   );
 }
 
