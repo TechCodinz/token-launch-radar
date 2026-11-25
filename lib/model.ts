@@ -260,7 +260,12 @@ export function scoreProtocol(
   const rawImplied = Math.round(
     protocol.tvl_usd * category_multiple * momentum * maturity * breadth * eligibility,
   );
-  const implied_value_usd = Math.max(IMPLIED_VALUE_FLOOR, rawImplied);
+  // Floor for ranking stability; also clamp at MAX_IMPLIED_VALUE so no row can ever
+  // exceed the board invariant that boardIssue enforces, however large a TVL gets.
+  const implied_value_usd = Math.min(
+    MAX_IMPLIED_VALUE,
+    Math.max(IMPLIED_VALUE_FLOOR, rawImplied),
+  );
 
   return {
     age_days,
