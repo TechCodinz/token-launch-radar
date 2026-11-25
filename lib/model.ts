@@ -325,7 +325,15 @@ function chainProfileFor(chains: string[]): ChainProfile {
   const hasEthereum = chains.includes('Ethereum');
   const l2s = chains.filter((c) => EVM_L2_CHAINS.has(c));
 
-  if (hasSolana && (chains[0] === 'Solana' || l2s.length === 0)) {
+  // Respect the protocol's own chain ordering between the two low-fee classes:
+  // Solana is the primary chain whenever it is listed ahead of every low-fee EVM
+  // chain (or none is listed). A minor L2 named later in the list must not jump
+  // ahead of a major low-fee chain the protocol itself lists earlier.
+  const firstL2 = l2s[0];
+  const solanaIndex = chains.indexOf('Solana');
+  const firstL2Index = firstL2 !== undefined ? chains.indexOf(firstL2) : -1;
+
+  if (hasSolana && (firstL2 === undefined || solanaIndex < firstL2Index)) {
     const rawSecondary =
       l2s[0] ?? (hasEthereum ? 'Ethereum' : chains.find((c) => c !== 'Solana') ?? null);
     return {
@@ -410,9 +418,26 @@ function establishedProductKind(protocol: SnapshotProtocol): string {
   return 'an established wrapped, staked, or exchange product';
 }
 
+/** Deterministic per-protocol rotation seed (djb2 over the slug); stable across runs, no randomness. */
+function slugSeed(slug: string): number {
+  let h = 5381;
+  for (let i = 0; i < slug.length; i++) {
+    h = ((h * 33) ^ slug.charCodeAt(i)) >>> 0;
+  }
+  return h;
+}
+
+/** Pick one of several step phrasings deterministically from a seed. */
+function pickVariant(variants: readonly string[], seed: number): string {
+  return variants[seed % variants.length]!;
+}
+
 /**
  * Generate exactly 6 concrete, plain-text farm steps derived strictly from category, chains,
  * TVL tier, listing age, and launch eligibility. No URLs and no unverified protocol-specific claims.
+ * Steps 3–6 rotate between two phrasings per branch on a deterministic per-protocol seed and
+ * weave in the protocol's own 7-day momentum, so plans inside one category/age bucket still
+ * differ in tactic and detail instead of repeating one template word-for-word.
  */
 export function buildFarmSteps(
   protocol: SnapshotProtocol,
@@ -429,6 +454,21 @@ export function buildFarmSteps(
       ? `${cp.primaryChain} and ${cp.secondaryChain}`
       : `${cp.primaryChain} and a major hub network`;
 
+  // Per-protocol rotation and momentum context for steps 3–6.
+  const seed = slugSeed(protocol.slug);
+  const changeTxt =
+    protocol.change_7d === null
+      ? null
+      : `${protocol.change_7d >= 0 ? '+' : ''}${protocol.change_7d.toFixed(1)}%`;
+  const momentumNote =
+    protocol.change_7d === null
+      ? 'no 7-day TVL change is recorded for it in the snapshot'
+      : protocol.change_7d >= 10
+        ? `7-day TVL momentum is a strong ${changeTxt}`
+        : protocol.change_7d <= -10
+          ? `7-day TVL momentum is a weak ${changeTxt}`
+          : `7-day TVL momentum is ${changeTxt}`;
+
   let steps: string[];
 
   if (established) {
@@ -436,28 +476,100 @@ export function buildFarmSteps(
     steps = [
       `No launch to farm: ${name} is ${kind} tracking a token that already trades, so do not commit airdrop-hunting capital here; treat it purely as an exposure tool and keep monitoring to 5 minutes/week.`,
       `Only use ${name} if you already want underlying asset custody, liquidity, or staking yield, sizing any voluntary allocation conservatively at ${tier.sizeRange} (${tier.tierLabel} tier) rather than chasing speculative points.`,
-      `If you hold or move exposure on ${cp.primaryChain}, keep transaction overhead inside a ${cp.gasBudget} gas budget (${cp.chainNote}) and avoid unnecessary deposits, withdrawals, or bridge round-trips.`,
-      `Before minting, staking, or bridging through ${name}, compare secondary-market spread against native mint or redemption fees (10 minutes) so slippage does not outweigh the underlying yield.`,
-      `Review peg stability, custody or validator risk, and withdrawal queues once a week (5 minutes/week over the ${horizon.adj} holding period) rather than assuming passive holding earns an unannounced token.`,
-      `Keep a lean log of entry cost, fees, and yield (5 minutes/month), and direct active farming hours toward unlaunched candidates carrying a full 1.00x launch-eligibility factor.`,
+      pickVariant(
+        [
+          `If you hold or move exposure on ${cp.primaryChain}, keep transaction overhead inside a ${cp.gasBudget} gas budget (${cp.chainNote}) and avoid unnecessary deposits, withdrawals, or bridge round-trips.`,
+          `Batch any unavoidable transfers on ${cp.primaryChain} into a single weekly window (5 minutes/week) so overhead stays inside the ${cp.gasBudget} gas budget (${cp.chainNote}) instead of leaking fees on every small move.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `Before minting, staking, or bridging through ${name}, compare secondary-market spread against native mint or redemption fees (10 minutes) so slippage does not outweigh the underlying yield.`,
+          `Check the peg or redemption discount on ${name} against its underlying asset once a week (5 minutes/week); a widening discount is your signal to exit via the cheapest route rather than hold on habit.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Review peg stability, custody or validator risk, and withdrawal queues once a week (5 minutes/week over the ${horizon.adj} holding period) rather than assuming passive holding earns an unannounced token.`,
+          `Once a week (5 minutes/week), scan for issuer or custodian announcements on ${name}; with ${momentumNote}, quiet weeks need no action beyond confirming the peg and your exit route over the ${horizon.adj} holding period.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Keep a lean log of entry cost, fees, and yield (5 minutes/month), and direct active farming hours toward unlaunched candidates carrying a full 1.00x launch-eligibility factor.`,
+          `Revisit this position monthly (5 minutes/month): if ${name} still offers no launch path, keep exposure minimal and let unlaunched candidates with a full 1.00x launch-eligibility factor absorb your active farming time.`,
+        ],
+        seed + 6,
+      ),
     ];
   } else if (cat === 'CEX' || cat === 'CeDeFi') {
     steps = [
       `Low-priority skip plan: ${name} is classified as ${cat}, where custodial balances rarely earn a retroactive onchain token airdrop; keep this behind pure DeFi targets and cap time at 5 minutes/week.`,
       `Do not park idle capital strictly to farm ${name}; if you already hold an account, limit optional activity to ${tier.sizeRange} (${tier.tierLabel} tier) only when you genuinely need execution.`,
-      `Keep onchain transfers minimal on ${cp.primaryChain} (${cp.gasBudget} gas budget; ${cp.chainNote}) rather than cycling deposits and withdrawals that erode capital in fees.`,
-      `If ${name} launches an opt-in product or any points or season programme it runs, spend 5 minutes/week checking eligibility rules before committing fresh funds over the ${horizon.adj} window.`,
-      `Prioritize self-custody protocols from higher-multiple categories first, and avoid KYC-gated lockups on ${name} unless net trading or yield utility justifies the commitment on its own.`,
-      `Record any account funding dates and fees in a simple spreadsheet (5 minutes/month) so you can unwind cleanly without mistaking exchange balances for active DeFi farm exposure.`,
+      pickVariant(
+        [
+          `Keep onchain transfers minimal on ${cp.primaryChain} (${cp.gasBudget} gas budget; ${cp.chainNote}) rather than cycling deposits and withdrawals that erode capital in fees.`,
+          `If you must move funds, route a single monthly transfer on ${cp.primaryChain} rather than weekly cycles (${cp.gasBudget} gas budget; ${cp.chainNote}); frequency earns nothing on a custodial venue.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `If ${name} launches an opt-in product or any points or season programme it runs, spend 5 minutes/week checking eligibility rules before committing fresh funds over the ${horizon.adj} window.`,
+          `Once a month (10 minutes), audit what ${name} actually offers holders — earn products, fee tiers, withdrawal terms — and only opt in when the utility stands on its own without any airdrop assumption.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Prioritize self-custody protocols from higher-multiple categories first, and avoid KYC-gated lockups on ${name} unless net trading or yield utility justifies the commitment on its own.`,
+          `Re-rank ${name} monthly against your DeFi targets: because ${momentumNote}, custodial TVL swings say little about a future token, so keep it last in the queue across the ${horizon.adj} window.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Record any account funding dates and fees in a simple spreadsheet (5 minutes/month) so you can unwind cleanly without mistaking exchange balances for active DeFi farm exposure.`,
+          `Keep one page of records (5 minutes/month): account funding dates, balances, and every fee charged, so any future eligibility snapshot can be matched against your own history.`,
+        ],
+        seed + 6,
+      ),
     ];
   } else if (cat === 'Dexs' || cat === 'Liquidity Manager') {
     steps = [
       `Prepare a dedicated wallet on ${cp.primaryChain} funded with ${tier.sizeRange} (${tier.tierLabel} tier; ${tier.splitNote}) plus a ${cp.gasBudget} gas buffer (${cp.chainNote}); setup takes 10 minutes.`,
       `Execute 2-3 organic spot swaps per week on ${name} across major pairs (10-15 minutes/week) to build consistent volume and distinct active weeks rather than one-off wash trades.`,
-      `Provide ${tier.sizeRange} into a deep, blue-chip liquidity pool on ${name} on ${cp.primaryChain} and keep the LP position active so resting liquidity is captured across snapshots.`,
-      `Rebalance or collect accrued swap fees every 2 weeks (15 minutes per review, within your ${cp.gasBudget} gas budget) to maintain active-range utilization and avoid stale out-of-range positions.`,
-      `Maintain the swap-and-LP cadence for ${horizon.span}, checking weekly (5 minutes/week) whether positions qualify for any points or season programme it runs without chasing risky micro-cap pools.`,
-      `Track swap volume, LP entry prices, impermanent loss, and cumulative gas in a farm log (5 minutes/week) before deciding whether to compound or unwind after the ${horizon.adj} cycle.`,
+      pickVariant(
+        [
+          `Provide ${tier.sizeRange} into a deep, blue-chip liquidity pool on ${name} on ${cp.primaryChain} and keep the LP position active so resting liquidity is captured across snapshots.`,
+          `Split the LP side across two fee tiers or two major pairs on ${name} rather than one pool, so your ${tier.sizeRange} keeps earning through volatility instead of sitting out of range in a single position.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `Rebalance or collect accrued swap fees every 2 weeks (15 minutes per review, within your ${cp.gasBudget} gas budget) to maintain active-range utilization and avoid stale out-of-range positions.`,
+          `Every week (10 minutes/week), compare your pool's fee APR on ${name} against the pair's volume trend; with ${momentumNote}, shift range only when volume — not price noise — justifies the gas.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Maintain the swap-and-LP cadence for ${horizon.span}, checking weekly (5 minutes/week) whether positions qualify for any points or season programme it runs without chasing risky micro-cap pools.`,
+          `Keep both swaps and LP running for ${horizon.span}; because ${momentumNote}, resist raising size after strong weeks and let consistent active weeks — not one big week — build the record.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Track swap volume, LP entry prices, impermanent loss, and cumulative gas in a farm log (5 minutes/week) before deciding whether to compound or unwind after the ${horizon.adj} cycle.`,
+          `Log each week's swap count, LP fees earned, and impermanent loss versus simply holding (5 minutes/week); exit the ${horizon.adj} cycle only if net fees beat the hold benchmark after gas.`,
+        ],
+        seed + 6,
+      ),
     ];
   } else if (
     cat === 'Lending' ||
@@ -469,10 +581,34 @@ export function buildFarmSteps(
     steps = [
       `Fund a dedicated wallet on ${cp.primaryChain} with ${tier.sizeRange} in a liquid collateral asset (${tier.tierLabel} tier; ${tier.splitNote}) and reserve ${cp.gasBudget} for gas (${cp.chainNote}); 10 minutes setup.`,
       `Supply your ${tier.sizeRange} collateral to a core ${name} market on ${cp.primaryChain} and verify that supply receipts and interest accrual update cleanly onchain (10 minutes).`,
-      `Borrow conservatively against your supply — keep loan-to-value at 30%-45% with a wide liquidation buffer — so your wallet records both lender and borrower usage on ${name}.`,
-      `Run a disciplined repay-and-reborrow or partial-top-up cycle every 1-2 weeks (10-15 minutes/week within your ${cp.gasBudget} gas budget) while checking health factor whenever volatility spikes.`,
-      `Hold the active supply-and-borrow loop for ${horizon.span}, spending 5 minutes/week monitoring borrow APR vs supply yield and verifying eligibility for any points or season programme it runs.`,
-      `Maintain a position log with collateral ratio, net borrow interest, and gas spend (5 minutes/week), and repay the debt in full before withdrawing collateral at the end of the ${horizon.adj} window.`,
+      pickVariant(
+        [
+          `Borrow conservatively against your supply — keep loan-to-value at 30%-45% with a wide liquidation buffer — so your wallet records both lender and borrower usage on ${name}.`,
+          `Split the borrow leg: draw a smaller tranche at 20%-30% loan-to-value in a second asset or market on ${name} so your usage spans more than one market without pushing overall liquidation risk higher.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `Run a disciplined repay-and-reborrow or partial-top-up cycle every 1-2 weeks (10-15 minutes/week within your ${cp.gasBudget} gas budget) while checking health factor whenever volatility spikes.`,
+          `Set a weekly health-factor check (10 minutes/week): if the factor drifts under 1.6, repay the riskiest tranche first; if it sits above 2.5, a modest top-up keeps the loop active inside your ${cp.gasBudget} gas budget.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Hold the active supply-and-borrow loop for ${horizon.span}, spending 5 minutes/week monitoring borrow APR vs supply yield and verifying eligibility for any points or season programme it runs.`,
+          `Sustain the supply-and-borrow loop for ${horizon.span}; because ${momentumNote}, let interest-rate spreads — not TVL headlines — decide whether the borrow leg stays open each week.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Maintain a position log with collateral ratio, net borrow interest, and gas spend (5 minutes/week), and repay the debt in full before withdrawing collateral at the end of the ${horizon.adj} window.`,
+          `Record net interest (supply yield minus borrow cost), liquidation-buffer history, and gas weekly (5 minutes/week); unwind at the end of the ${horizon.adj} window only after the borrow is fully repaid and receipts are withdrawn.`,
+        ],
+        seed + 6,
+      ),
     ];
   } else if (
     cat === 'Derivatives' ||
@@ -485,10 +621,34 @@ export function buildFarmSteps(
     steps = [
       `Deposit ${tier.sizeRange} of stable margin into a fresh wallet for ${name} on ${cp.primaryChain} (${tier.tierLabel} tier; ${tier.splitNote}) and budget ${cp.gasBudget} for gas (${cp.chainNote}); 10 minutes setup.`,
       `Open small, low-leverage (1x-2x) hedged perpetual or derivative positions on liquid markets inside ${name}, pairing exposure against spot or an offsetting leg to keep directional risk tight.`,
-      `Place 2-4 measured trades per week (15-20 minutes/week) and let positions stay open for at least several hours so activity reflects genuine open interest rather than instant round-trips.`,
-      `Cap weekly trading fees and funding drag below 1% of your ${tier.sizeRange} margin, keeping onchain settlement within the ${cp.gasBudget} gas allowance on ${cp.primaryChain}.`,
-      `Sustain weekly trading and margin activity for ${horizon.span}, checking once a week (5 minutes/week) how volume and open interest count toward any points or season programme it runs.`,
-      `Log realized PnL, funding paid, trading fees, and open-interest days weekly (5 minutes/week), then flatten hedges cleanly before withdrawing margin after the ${horizon.adj} horizon.`,
+      pickVariant(
+        [
+          `Place 2-4 measured trades per week (15-20 minutes/week) and let positions stay open for at least several hours so activity reflects genuine open interest rather than instant round-trips.`,
+          `Alternate instruments week to week on ${name} — perps one week, options or rate products the next where offered — so your history shows breadth of genuine usage rather than a single repeated trade.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `Cap weekly trading fees and funding drag below 1% of your ${tier.sizeRange} margin, keeping onchain settlement within the ${cp.gasBudget} gas allowance on ${cp.primaryChain}.`,
+          `Review funding rates before each session (10 minutes/week): skip weeks when funding on your side of the trade runs hot, since ${momentumNote} and expensive carry erase thin farming gains.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Sustain weekly trading and margin activity for ${horizon.span}, checking once a week (5 minutes/week) how volume and open interest count toward any points or season programme it runs.`,
+          `Trade through ${horizon.span} without a gap longer than one week; because ${momentumNote}, keep position size flat across hot and cold weeks so the activity record reads as steady participation.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Log realized PnL, funding paid, trading fees, and open-interest days weekly (5 minutes/week), then flatten hedges cleanly before withdrawing margin after the ${horizon.adj} horizon.`,
+          `Log margin balance, fee-to-volume ratio, and days with open interest each week (5 minutes/week); flatten and withdraw after the ${horizon.adj} horizon if fees consumed more than the positions earned.`,
+        ],
+        seed + 6,
+      ),
     ];
   } else if (
     cat === 'Yield' ||
@@ -505,28 +665,100 @@ export function buildFarmSteps(
       isCurator
         ? `Deposit ${tier.sizeRange} into one of ${name}'s flagship curated vaults on ${cp.primaryChain} after checking underlying lending markets, collateral caps, and curator performance fees (10-15 minutes).`
         : `Deposit ${tier.sizeRange} into one of ${name}'s primary audited vaults on ${cp.primaryChain} with healthy TVL and transparent underlying strategies (10-15 minutes initial deposit).`,
-      `Leave vault shares staked or compounding continuously rather than hopping vaults daily, adding a small weekly top-up or harvest action (10 minutes/week) to register recurring activity.`,
-      `Review strategy APY, withdrawal queue terms, and collateral composition once a week (10 minutes/week) while keeping maintenance transactions inside your ${cp.gasBudget} gas budget.`,
-      `Hold the compounding vault position across ${horizon.span} so time-weighted balance snapshots accumulate under any points or season programme it runs.`,
-      `Record vault share price, net yield earned, and total gas costs weekly (5 minutes/week) so you can measure true net return before unwinding after ${horizon.span}.`,
+      pickVariant(
+        [
+          `Leave vault shares staked or compounding continuously rather than hopping vaults daily, adding a small weekly top-up or harvest action (10 minutes/week) to register recurring activity.`,
+          `Claim and restake accrued yield every week (10 minutes/week) instead of letting rewards sit idle, so the wallet shows continuous compounding activity on ${cp.primaryChain}.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `Review strategy APY, withdrawal queue terms, and collateral composition once a week (10 minutes/week) while keeping maintenance transactions inside your ${cp.gasBudget} gas budget.`,
+          `Compare ${name}'s vault APY against its own recent average and the underlying markets once a week (10 minutes/week), and rotate only if a shortfall persists across two straight reviews.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Hold the compounding vault position across ${horizon.span} so time-weighted balance snapshots accumulate under any points or season programme it runs.`,
+          `Hold the compounding vault position across ${horizon.span}; because ${momentumNote}, avoid chasing size increases after strong weeks and let time-weighted balance do the work.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Record vault share price, net yield earned, and total gas costs weekly (5 minutes/week) so you can measure true net return before unwinding after ${horizon.span}.`,
+          `Log entry share price, weekly yield, and cumulative gas (5 minutes/week) and pre-set your exit rule: unwind after ${horizon.span} unless the position still clears your hurdle rate after fees.`,
+        ],
+        seed + 6,
+      ),
     ];
   } else if (cat === 'Bridge' || cat === 'Canonical Bridge' || cat === 'Cross Chain Bridge') {
     steps = [
       `Allocate ${tier.sizeRange} of liquid stablecoins or native assets (${tier.tierLabel} tier; ${tier.splitNote}) and a ${cp.gasBudget} gas budget (${cp.chainNote}) in a dedicated bridging wallet; 10 minutes setup.`,
       `Route 1-2 genuine cross-chain transfers per week through ${name} between ${routeNote} (10-15 minutes/week) to build recurring bridge volume across distinct source and destination chains.`,
-      `Vary transfer sizes naturally within your ${tier.sizeRange} band and leave bridged funds on the destination chain for several days before bridging back so flows look organic.`,
-      `Check quoted slippage and relayer fees before every transfer so combined bridge fees and ${cp.gasBudget} gas stay well controlled across ${protocol.chains.length} supported chain${protocol.chains.length === 1 ? '' : 's'}.`,
-      `Continue steady cross-chain volume over ${horizon.span}, spending 5 minutes/week verifying transaction completion and checking eligibility under any points or season programme it runs.`,
-      `Log source chain, destination chain, bridged USD volume, and fees per transfer (5 minutes/week) to track cumulative volume without stranding dust balances across networks.`,
+      pickVariant(
+        [
+          `Vary transfer sizes naturally within your ${tier.sizeRange} band and leave bridged funds on the destination chain for several days before bridging back so flows look organic.`,
+          `Alternate direction and route each week — send via ${routeNote} one week and return by a different corridor the next — so volume is not a single repeated round-trip pattern.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `Check quoted slippage and relayer fees before every transfer so combined bridge fees and ${cp.gasBudget} gas stay well controlled across ${protocol.chains.length} supported chain${protocol.chains.length === 1 ? '' : 's'}.`,
+          `Before each transfer, compare ${name}'s quote against one alternative route (5 minutes); if fees differ materially, split the transfer so most volume still lands on ${name} at a fair price.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Continue steady cross-chain volume over ${horizon.span}, spending 5 minutes/week verifying transaction completion and checking eligibility under any points or season programme it runs.`,
+          `Keep weekly transfers going for ${horizon.span}; because ${momentumNote}, hold transfer size steady and let distinct active weeks accumulate instead of front-loading volume.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Log source chain, destination chain, bridged USD volume, and fees per transfer (5 minutes/week) to track cumulative volume without stranding dust balances across networks.`,
+          `Maintain a route ledger — date, corridor, USD value, fee paid, completion time (5 minutes/week) — across all ${protocol.chains.length} supported chains, and consolidate dust balances monthly.`,
+        ],
+        seed + 6,
+      ),
     ];
   } else if (cat === 'RWA') {
     steps = [
       `Check ${name}'s jurisdiction, accreditation, and KYC/onboarding requirements first (15 minutes) before moving funds, since RWA issuers often restrict minting or redemption to verified wallets.`,
       `Fund an approved wallet on ${cp.primaryChain} with ${tier.sizeRange} in supported stablecoins (${tier.tierLabel} tier; ${tier.splitNote}) plus ${cp.gasBudget} for gas (${cp.chainNote}).`,
-      `Mint or deposit into ${name}'s core tokenized yield asset on ${cp.primaryChain} and confirm the balance settles properly in your wallet (15 minutes).`,
-      `Hold the RWA balance continuously and perform light weekly maintenance — checking yield accrual, redemption windows, or secondary liquidity (10 minutes/week within ${cp.gasBudget} gas).`,
-      `Maintain the deposit for ${horizon.span} so holding duration counts across snapshots and any points or season programme it runs, while confirming T+0/T+1 exit liquidity before scaling up.`,
-      `Keep a clean compliance and yield log (deposit timestamps, KYC wallet address, accrued yield, and gas; 5 minutes/week) to simplify tax reporting and eventual redemption.`,
+      pickVariant(
+        [
+          `Mint or deposit into ${name}'s core tokenized yield asset on ${cp.primaryChain} and confirm the balance settles properly in your wallet (15 minutes).`,
+          `Stage the deposit in two tranches a week apart (${tier.sizeRange} total) so both a mint and a follow-on top-up appear in your wallet history on ${cp.primaryChain}.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `Hold the RWA balance continuously and perform light weekly maintenance — checking yield accrual, redemption windows, or secondary liquidity (10 minutes/week within ${cp.gasBudget} gas).`,
+          `Verify each week (10 minutes/week) that distributions or yield accruals actually landed in the approved wallet; a missing accrual is an onboarding or whitelist problem to fix early, not at redemption.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Maintain the deposit for ${horizon.span} so holding duration counts across snapshots and any points or season programme it runs, while confirming T+0/T+1 exit liquidity before scaling up.`,
+          `Maintain the deposit for ${horizon.span}; because ${momentumNote}, treat RWA momentum as secondary — redemption terms and issuer reporting discipline matter more than one strong week.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Keep a clean compliance and yield log (deposit timestamps, KYC wallet address, accrued yield, and gas; 5 minutes/week) to simplify tax reporting and eventual redemption.`,
+          `Keep the compliance file current (5 minutes/week): KYC wallet, deposit confirmations, yield statements, and the redemption notice period, so exit at the end of ${horizon.span} is a formality.`,
+        ],
+        seed + 6,
+      ),
     ];
   } else if (
     cat === 'Liquid Staking' ||
@@ -540,19 +772,67 @@ export function buildFarmSteps(
     steps = [
       `Prepare a fresh wallet on ${cp.primaryChain} holding ${tier.sizeRange} of the native staking asset (${tier.tierLabel} tier; ${tier.splitNote}) plus ${cp.gasBudget} for gas (${cp.chainNote}); 10 minutes setup.`,
       `Stake ${tier.sizeRange} directly through ${name}'s minting contract on ${cp.primaryChain} rather than only swapping on a secondary DEX so the protocol records a direct staking deposit (10 minutes).`,
-      `Put the minted receipt token to work productively — hold it in your wallet or supply it to a conservative lending or liquidity venue on ${cp.primaryChain} without taking excess leverage.`,
-      `Check staking yield, receipt-token peg discount, and unbonding queue length once per week (10 minutes/week), keeping any restaking or claim actions inside your ${cp.gasBudget} gas budget.`,
-      `Hold the staked position continuously for ${horizon.span} to build unbroken time-weighted balance for any points or season programme it runs.`,
-      `Log mint rate, staking APY, receipt deployments, and gas spend weekly (5 minutes/week), and compare instant-swap exit vs native unstaking queue before unwinding after ${horizon.span}.`,
+      pickVariant(
+        [
+          `Put the minted receipt token to work productively — hold it in your wallet or supply it to a conservative lending or liquidity venue on ${cp.primaryChain} without taking excess leverage.`,
+          `Keep half the receipt tokens liquid in-wallet and supply only the other half to a conservative venue on ${cp.primaryChain}, balancing productive use against a fast exit if the peg slips.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `Check staking yield, receipt-token peg discount, and unbonding queue length once per week (10 minutes/week), keeping any restaking or claim actions inside your ${cp.gasBudget} gas budget.`,
+          `Track the receipt token's secondary-market discount weekly (10 minutes/week): a discount beyond 1% is a signal to prefer the native unstaking queue over a market exit.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Hold the staked position continuously for ${horizon.span} to build unbroken time-weighted balance for any points or season programme it runs.`,
+          `Hold the staked position continuously for ${horizon.span}; because ${momentumNote}, do not lever the receipt token after strong weeks — unbroken holding time is the metric that matters here.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Log mint rate, staking APY, receipt deployments, and gas spend weekly (5 minutes/week), and compare instant-swap exit vs native unstaking queue before unwinding after ${horizon.span}.`,
+          `Log mint rate, APY drift, and any queue waits weekly (5 minutes/week), and decide the exit — instant swap versus native unstake — before the ${horizon.adj} period ends, not after.`,
+        ],
+        seed + 6,
+      ),
     ];
   } else {
     steps = [
       `Fund a dedicated wallet on ${cp.primaryChain} with ${tier.sizeRange} (${tier.tierLabel} tier; ${tier.splitNote}) and keep ${cp.gasBudget} reserved for gas (${cp.chainNote}); 10 minutes setup.`,
       `Complete one core product action on ${name} on ${cp.primaryChain} — depositing, transacting, or opening a primary position — so your wallet registers authentic first-party usage (15 minutes).`,
-      `Return once per week for 10-15 minutes to perform a meaningful core interaction on ${name} (such as topping up, transacting, or rebalancing) rather than leaving the wallet dormant.`,
-      `Keep onchain activity disciplined within your ${cp.gasBudget} gas budget on ${cp.primaryChain}${cp.secondaryChain ? ` (optionally testing ${cp.secondaryChain} as a second active chain)` : ''}.`,
-      `Sustain weekly usage and an active balance across ${horizon.span}, spending 5 minutes/week verifying whether ongoing usage qualifies under any points or season programme it runs.`,
-      `Document wallet address, transaction dates, active balance, and cumulative gas in a farm log (5 minutes/week) so you can cleanly review or unwind after the ${horizon.adj} period.`,
+      pickVariant(
+        [
+          `Return once per week for 10-15 minutes to perform a meaningful core interaction on ${name} (such as topping up, transacting, or rebalancing) rather than leaving the wallet dormant.`,
+          `Vary the weekly interaction on ${name} — alternate between a deposit-style action, a transaction, and a governance or settings touch (10-15 minutes/week) so usage reads as genuine product exploration.`,
+        ],
+        seed + 3,
+      ),
+      pickVariant(
+        [
+          `Keep onchain activity disciplined within your ${cp.gasBudget} gas budget on ${cp.primaryChain}${cp.secondaryChain ? ` (optionally testing ${cp.secondaryChain} as a second active chain)` : ''}.`,
+          `Review your activity monthly (10 minutes): confirm transactions on ${cp.primaryChain} actually registered in the product's interface, and note that ${momentumNote} before deciding whether to raise or hold size.`,
+        ],
+        seed + 4,
+      ),
+      pickVariant(
+        [
+          `Sustain weekly usage and an active balance across ${horizon.span}, spending 5 minutes/week verifying whether ongoing usage qualifies under any points or season programme it runs.`,
+          `Sustain weekly usage and an active balance across ${horizon.span}; because ${momentumNote}, consistency of active weeks outweighs transaction size for a protocol with no announced programme.`,
+        ],
+        seed + 5,
+      ),
+      pickVariant(
+        [
+          `Document wallet address, transaction dates, active balance, and cumulative gas in a farm log (5 minutes/week) so you can cleanly review or unwind after the ${horizon.adj} period.`,
+          `Keep the farm log lean (5 minutes/week) — wallet, dates, action type, balance after, gas paid — and do a full review at the end of the ${horizon.adj} period before committing another cycle.`,
+        ],
+        seed + 6,
+      ),
     ];
   }
 

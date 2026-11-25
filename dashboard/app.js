@@ -193,15 +193,22 @@
         av = a.tvl_usd;
         bv = b.tvl_usd;
       } else if (state.sort === 'change') {
-        av = a.change_7d === null ? -1e9 : a.change_7d;
-        bv = b.change_7d === null ? -1e9 : b.change_7d;
+        av = a.change_7d;
+        bv = b.change_7d;
       } else if (state.sort === 'age') {
-        av = a.age_days === null ? -1 : a.age_days;
-        bv = b.age_days === null ? -1 : b.age_days;
+        av = a.age_days;
+        bv = b.age_days;
       } else {
         av = a.rank;
         bv = b.rank;
       }
+      // Unknown (null) metrics carry no signal, so they always sort last in
+      // both directions; the direction multiplier must never promote them.
+      var aNull = av === null || av === undefined;
+      var bNull = bv === null || bv === undefined;
+      if (aNull && bNull) return a.rank - b.rank;
+      if (aNull) return 1;
+      if (bNull) return -1;
       if (av !== bv) return (av - bv) * mul;
       return a.rank - b.rank;
     });
